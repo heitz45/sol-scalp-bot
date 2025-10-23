@@ -40,10 +40,6 @@ const {
   AUTOPILOT_COOLDOWN_MIN = '30',
   AUTOPILOT_BLACKLIST = '',
 
-  // Dexscreener base (override if needed)
-  DEXSCREENER_BASE = 'https://api.dexscreener.com'
-} = process.env;
-
 if (!WALLET_PRIVATE_KEY_BASE58) { console.error('Missing WALLET_PRIVATE_KEY_BASE58'); process.exit(1); }
 if (!TELEGRAM_BOT_TOKEN) { console.error('Missing TELEGRAM_BOT_TOKEN'); process.exit(1); }
 
