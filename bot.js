@@ -1,7 +1,7 @@
 // bot.js — Fully-automated thin-liquidity SCALP bot for Solana
 // Features: Auth, whoami/authstatus, sharded buys/sells, TP/SL monitor,
 // Autopilot (Dexscreener) with Telegram toggle & filter editing,
-// Improved Dexscreener fetch (headers, timeout, retries, fallbacks),
+// Dexscreener fetch via search endpoint (chain:solana) with retries/fallbacks,
 // Debug commands: /scan (force scan), /autosim (routing sanity).
 
 import 'dotenv/config';
@@ -605,7 +605,7 @@ async function monitorPositions() {
 }
 setInterval(monitorPositions, Number(POLL_SECONDS) * 1000);
 
-// -------------------- DEXSCREENER FETCH (robust) --------------------
+// -------------------- DEXSCREENER FETCH via SEARCH --------------------
 async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
   const url = `${DEXSCREENER_BASE}${path}`;
   let lastErr;
@@ -617,7 +617,6 @@ async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
           'Accept': 'application/json'
         }
       };
-      // Per-request timeout (Node 20+)
       if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
         opts.signal = AbortSignal.timeout(15000);
       }
@@ -636,38 +635,30 @@ async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
   throw lastErr;
 }
 
+/**
+ * Dexscreener does NOT expose "list all pairs by chain" — use search:
+ *   /latest/dex/search?q=chain:solana
+ * We chain a few Solana-centric queries to broaden coverage a bit.
+ */
 async function fetchDexScreenerSolanaPairs() {
-  // Primary feed
   try {
-    const data = await fetchDexscreenerJson('/latest/dex/pairs/solana', { tries: 3 });
-    if (Array.isArray(data?.pairs) && data.pairs.length) return data.pairs;
-    console.warn('[DEX] primary feed returned no pairs, falling back…');
+    const queries = [
+      'chain:solana',
+      'solana raydium',
+      'solana orca'
+    ];
+    for (const q of queries) {
+      const data = await fetchDexscreenerJson(`/latest/dex/search?q=${encodeURIComponent(q)}`, { tries: 3 });
+      const pairs = Array.isArray(data?.pairs) ? data.pairs.filter(p =>
+        p.chainId === 'solana' || /solana/i.test(p.chainId || '')
+      ) : [];
+      if (pairs.length) return pairs;
+      console.warn(`[DEX] search "${q}" returned 0 pairs, trying next…`);
+    }
   } catch (e) {
-    console.error('[DEX] primary feed error:', e.message);
+    console.error('[DEX] search error:', e.message);
   }
-
-  // Fallback #1: tokens feed
-  try {
-    const data2 = await fetchDexscreenerJson('/latest/dex/tokens/solana', { tries: 2 });
-    if (Array.isArray(data2?.pairs) && data2.pairs.length) return data2.pairs;
-    console.warn('[DEX] tokens feed returned no pairs, trying search fallback…');
-  } catch (e) {
-    console.error('[DEX] tokens feed error:', e.message);
-  }
-
-  // Fallback #2: search feed (filter to Solana in code)
-  try {
-    const data3 = await fetchDexscreenerJson('/latest/dex/search?q=solana', { tries: 2 });
-    const pairs = Array.isArray(data3?.pairs) ? data3.pairs.filter(p =>
-      p.chainId === 'solana' || /solana/i.test(p.chainId || '')
-    ) : [];
-    if (pairs.length) return pairs;
-    console.warn('[DEX] search fallback returned no pairs.');
-  } catch (e) {
-    console.error('[DEX] search fallback error:', e.message);
-  }
-
-  throw new Error('All Dexscreener endpoints failed');
+  throw new Error('Dexscreener search returned no pairs');
 }
 
 // -------------------- AUTOPILOT: select + loop --------------------
