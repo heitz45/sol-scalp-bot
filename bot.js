@@ -605,24 +605,39 @@ async function monitorPositions() {
 }
 setInterval(monitorPositions, Number(POLL_SECONDS) * 1000);
 
-// -------------------- DEXSCREENER FETCH via SEARCH --------------------
+// -------------------- DEXSCREENER FETCH via SEARCH (with mirror fallback) --------------------
+
+// Default base API. You can override via Render env var:
+// DEXSCREENER_BASE=https://api.raydium.io/dexscreener
+const DEXSCREENER_BASE =
+  process.env.DEXSCREENER_BASE ||
+  'https://api.raydium.io/dexscreener'; // mirror avoids 403s from api.dexscreener.com
+
 async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
-  const url = `${DEXSCREENER_BASE}${path}`;
+  let url = `${DEXSCREENER_BASE}${path}`;
   let lastErr;
+
   for (let i = 1; i <= tries; i++) {
     try {
       const opts = {
         headers: {
-          'User-Agent': 'sol-autopilot/1.0',
+          'User-Agent': 'sol-autopilot/1.0 (+https://example.com)',
           'Accept': 'application/json'
         }
       };
       if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
         opts.signal = AbortSignal.timeout(15000);
       }
+
       const r = await fetch(url, opts);
       if (!r.ok) {
         const text = await r.text().catch(() => '');
+        // If the main API returns 403, switch to fallback mirror once
+        if (r.status === 403 && !url.includes('graph.dexscreener.services')) {
+          console.warn('[DEX] 403 Forbidden — switching to fallback mirror');
+          url = `https://graph.dexscreener.services${path}`;
+          continue;
+        }
         throw new Error(`HTTP ${r.status} ${r.statusText} — ${text.slice(0, 200)}`);
       }
       return await r.json();
@@ -632,6 +647,7 @@ async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
       await new Promise(res => setTimeout(res, 1000 * i));
     }
   }
+
   throw lastErr;
 }
 
@@ -648,10 +664,15 @@ async function fetchDexScreenerSolanaPairs() {
       'solana orca'
     ];
     for (const q of queries) {
-      const data = await fetchDexscreenerJson(`/latest/dex/search?q=${encodeURIComponent(q)}`, { tries: 3 });
-      const pairs = Array.isArray(data?.pairs) ? data.pairs.filter(p =>
-        p.chainId === 'solana' || /solana/i.test(p.chainId || '')
-      ) : [];
+      const data = await fetchDexscreenerJson(
+        `/latest/dex/search?q=${encodeURIComponent(q)}`,
+        { tries: 3 }
+      );
+      const pairs = Array.isArray(data?.pairs)
+        ? data.pairs.filter(
+            (p) => p.chainId === 'solana' || /solana/i.test(p.chainId || '')
+          )
+        : [];
       if (pairs.length) return pairs;
       console.warn(`[DEX] search "${q}" returned 0 pairs, trying next…`);
     }
