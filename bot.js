@@ -1,5 +1,5 @@
-// bot.js — Thin-Liquidity SCALP Bot for Solana (Telegram-controlled)
-// Paste this entire file in Replit as bot.js. Secrets are loaded from Replit Secrets (env vars).
+// bot.js — Thin-Liquidity SCALP Bot for Solana with robust auth, whoami, and debug ID logger.
+// Secrets come from environment variables (Replit/Render/.env). Do NOT hard-code secrets.
 
 import 'dotenv/config';
 import fs from 'fs';
@@ -13,17 +13,19 @@ import {
   VersionedTransaction
 } from '@solana/web3.js';
 
-// -------------------- ENV (read from Replit Secrets) --------------------
+// -------------------- ENV --------------------
 const {
   RPC_URL = 'https://api.mainnet-beta.solana.com',
   WALLET_PRIVATE_KEY_BASE58,
   TELEGRAM_BOT_TOKEN,
-  TELEGRAM_ALLOWED_USER_ID,
+  TELEGRAM_ALLOWED_USER_ID = '',          // one ID or comma-separated list of IDs
+  TELEGRAM_ALLOWED_CHAT_ID = '',          // optional: allow a specific chat.id (e.g., group)
+  DEBUG_IDS = 'false',                    // 'true' to log incoming from.id/chat.id
   MAX_SLIPPAGE_BPS = '300',
   DEFAULT_BUY_SOL = '0.05',
   POLL_SECONDS = '10',
 
-  // Thin-liquidity tuning (safe defaults)
+  // Thin-liquidity tuning
   THIN_MAX_SLIPPAGE_BPS_BASE = '200',
   THIN_MAX_SLIPPAGE_BPS_CAP  = '500',
   THIN_TARGET_IMPACT_PCT     = '2.0',
@@ -35,27 +37,47 @@ const {
   THIN_EXIT_DELAY_MS         = '1200'
 } = process.env;
 
-// -------------------- SAFETY / CHECKS --------------------
+// -------------------- BASIC CHECKS --------------------
 if (!WALLET_PRIVATE_KEY_BASE58) {
-  console.error('Missing WALLET_PRIVATE_KEY_BASE58 environment variable. Add it to Replit Secrets.');
+  console.error('Missing WALLET_PRIVATE_KEY_BASE58. Add it to your environment/Secrets.');
   process.exit(1);
 }
-if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_ALLOWED_USER_ID) {
-  console.error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_USER_ID in environment.');
+if (!TELEGRAM_BOT_TOKEN) {
+  console.error('Missing TELEGRAM_BOT_TOKEN. Add your BotFather token to the environment.');
   process.exit(1);
 }
 
-// -------------------- Convert keypair (safe, no logging of secret) --------------------
+// -------------------- AUTH SETUP --------------------
+// Allow one or many user IDs: e.g. TELEGRAM_ALLOWED_USER_ID="111,222"
+const USER_ALLOWLIST = TELEGRAM_ALLOWED_USER_ID.split(',')
+  .map(s => s.trim())
+  .filter(Boolean); // array of strings
+
+// Optional chat allow (group or specific DM chat id)
+const CHAT_ALLOWLIST = TELEGRAM_ALLOWED_CHAT_ID.split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// Allowed helper: permit if from.id is in list OR chat.id is in chat-allowlist.
+// If no allowlist provided, default to deny-all.
+function allowed(ctx) {
+  const fromId = String(ctx.from?.id || '');
+  const chatId = String(ctx.chat?.id || '');
+  const userOk = USER_ALLOWLIST.length ? USER_ALLOWLIST.includes(fromId) : false;
+  const chatOk = CHAT_ALLOWLIST.length ? CHAT_ALLOWLIST.includes(chatId) : false;
+  return userOk || chatOk;
+}
+
+// -------------------- KEYPAIR --------------------
 let keypair;
 try {
   const secretBytes = bs58.decode(WALLET_PRIVATE_KEY_BASE58);
   keypair = Keypair.fromSecretKey(Uint8Array.from(secretBytes));
 } catch (err) {
-  console.error('Failed to decode WALLET_PRIVATE_KEY_BASE58. Ensure it is a valid base58-encoded secret key.');
+  console.error('Failed to decode WALLET_PRIVATE_KEY_BASE58. Ensure it is a valid base58-encoded secret.');
   process.exit(1);
 }
 
-// Log only the public key (safe)
 console.log('Bot wallet public key:', keypair.publicKey.toBase58());
 
 // -------------------- CONSTANTS --------------------
@@ -64,8 +86,8 @@ const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 
 // Hard-coded SCALP triggers
-const SCALP_TP_PCT = 20; // +20% take-profit
-const SCALP_SL_PCT = 10; // -10% stop-loss
+const SCALP_TP_PCT = 20; // +20%
+const SCALP_SL_PCT = 10; // -10%
 
 // Thin-liquidity numeric casts
 const THIN = {
@@ -80,9 +102,12 @@ const THIN = {
   EXIT_DELAY_MS: Number(THIN_EXIT_DELAY_MS)
 };
 
-// -------------------- AUTH --------------------
-function allowed(ctx) {
-  return String(ctx.from?.id) === String(TELEGRAM_ALLOWED_USER_ID);
+// -------------------- OPTIONAL DEBUGGER --------------------
+if (String(DEBUG_IDS).toLowerCase() === 'true') {
+  bot.on('message', (ctx, next) => {
+    console.log('DBG from.id=', ctx.from?.id, 'chat.id=', ctx.chat?.id, 'username=@' + (ctx.from?.username || 'n/a'));
+    return next();
+  });
 }
 
 // -------------------- PERSISTENCE --------------------
@@ -99,7 +124,7 @@ function savePositions() {
   fs.writeFileSync(POSITIONS_FILE, JSON.stringify(positions, null, 2));
 }
 let positions = loadPositions(); // keyed by mint
-let lastChatId = null; // stored when allowed user messages bot
+let lastChatId = null;
 
 // -------------------- JUPITER HELPERS --------------------
 async function jupQuote({ inputMint, outputMint, amountRaw, slippageBps }) {
@@ -215,7 +240,7 @@ async function buyBySol({ mint, amountSol, slippageBps }) {
       const smallerImpact = extractImpactPct(smallerRoute);
 
       if (!Number.isNaN(smallerImpact) && smallerImpact <= impact) {
-        const sig = await jupBuildAndSend({ quoteResponse: smallerRoute });
+        await jupBuildAndSend({ quoteResponse: smallerRoute });
         spentLamports += BigInt(smallerRoute.inAmount || smallerLamports);
         receivedRaw   += BigInt(smallerRoute.outAmount);
         remainingSol  -= smallerSol;
@@ -225,7 +250,7 @@ async function buyBySol({ mint, amountSol, slippageBps }) {
       }
     }
 
-    const sig = await jupBuildAndSend({ quoteResponse: route });
+    await jupBuildAndSend({ quoteResponse: route });
     spentLamports += BigInt(route.inAmount || lamports);
     receivedRaw   += BigInt(route.outAmount);
     remainingSol  -= proposedSol;
@@ -262,7 +287,7 @@ async function sellTokensForSol({ mint, amountRaw, slippageBps }) {
       slippageBps: Math.min(Number(slippageBps || THIN.SLIPPAGE_BASE), THIN.SLIPPAGE_CAP)
     });
 
-    const sig = await jupBuildAndSend({ quoteResponse: route });
+    await jupBuildAndSend({ quoteResponse: route });
     soldLamports += BigInt(route.outAmount);
     remaining    -= BigInt(route.inAmount || slice);
 
@@ -273,11 +298,24 @@ async function sellTokensForSol({ mint, amountRaw, slippageBps }) {
 }
 
 // -------------------- TELEGRAM COMMANDS --------------------
-bot.start((ctx) => {
-  if (!allowed(ctx)) return ctx.reply('Not authorized.');
+// Helper to gate commands
+function authGuard(handler) {
+  return (ctx) => {
+    if (!allowed(ctx)) return ctx.reply('Not authorized.');
+    return handler(ctx);
+  };
+}
+
+// whoami: print ids (useful to set TELEGRAM_ALLOWED_USER_ID)
+bot.command('whoami', (ctx) => {
+  ctx.reply(`Your user id: ${ctx.from?.id}\nChat id: ${ctx.chat?.id}\nUsername: @${ctx.from?.username || 'n/a'}`);
+});
+
+bot.start(authGuard((ctx) => {
   lastChatId = ctx.chat?.id || lastChatId;
   ctx.reply(
 `Ready. Commands:
+/whoami
 /bal
 /buy <mint> [sol]
 /sell <mint> [percent]
@@ -287,20 +325,19 @@ bot.start((ctx) => {
 
 Wallet: ${keypair.publicKey.toBase58()}`
   );
-});
+}));
 
-bot.on('message', (ctx) => {
+bot.on('message', (ctx, next) => {
   if (allowed(ctx)) lastChatId = ctx.chat?.id || lastChatId;
+  return next();
 });
 
-bot.command('bal', async (ctx) => {
-  if (!allowed(ctx)) return ctx.reply('Not authorized.');
+bot.command('bal', authGuard(async (ctx) => {
   const bal = await connection.getBalance(keypair.publicKey);
   ctx.reply(`SOL: ${(bal/1e9).toFixed(4)} — ${keypair.publicKey.toBase58()}`);
-});
+}));
 
-bot.command('buy', async (ctx) => {
-  if (!allowed(ctx)) return ctx.reply('Not authorized.');
+bot.command('buy', authGuard(async (ctx) => {
   const [, mint, solStr] = ctx.message.text.trim().split(/\s+/);
   const amountSol = solStr ?? DEFAULT_BUY_SOL;
   if (!mint) return ctx.reply('Usage: /buy <mint> [sol]');
@@ -321,10 +358,9 @@ Shards: ${shardsExecuted}`
   } catch (e) {
     ctx.reply(`Buy failed: ${e.message}`);
   }
-});
+}));
 
-bot.command('sell', async (ctx) => {
-  if (!allowed(ctx)) return ctx.reply('Not authorized.');
+bot.command('sell', authGuard(async (ctx) => {
   const [, mint, pctStr] = ctx.message.text.trim().split(/\s+/);
   const pct = Number(pctStr ?? '100');
   if (!mint || isNaN(pct) || pct <= 0 || pct > 100) return ctx.reply('Usage: /sell <mint> [percent 1-100]');
@@ -341,10 +377,9 @@ bot.command('sell', async (ctx) => {
   } catch (e) {
     ctx.reply(`Sell failed: ${e.message}`);
   }
-});
+}));
 
-bot.command('autobuy', async (ctx) => {
-  if (!allowed(ctx)) return ctx.reply('Not authorized.');
+bot.command('autobuy', authGuard(async (ctx) => {
   const parts = ctx.message.text.trim().split(/\s+/);
   const mint = parts[1];
   const solStr = parts[2] || DEFAULT_BUY_SOL;
@@ -366,7 +401,6 @@ Profile: SCALP (thin-liquidity)
 
   try {
     await verifyMintExists(mint);
-
     const { outAmountRaw, totalSpentLamports, shardsExecuted } = await buyBySol({
       mint,
       amountSol: sol,
@@ -397,10 +431,9 @@ TP: +${SCALP_TP_PCT}% | SL: -${SCALP_SL_PCT}%`
   } catch (e) {
     ctx.reply(`Autobuy failed: ${e.message}`);
   }
-});
+}));
 
-bot.command('status', async (ctx) => {
-  if (!allowed(ctx)) return ctx.reply('Not authorized.');
+bot.command('status', authGuard((ctx) => {
   if (!Object.keys(positions).length) return ctx.reply('No active positions.');
   let msg = 'Active positions:\n';
   for (const p of Object.values(positions)) {
@@ -411,17 +444,16 @@ bot.command('status', async (ctx) => {
   Since: ${p.createdAt}\n`;
   }
   ctx.reply(msg);
-});
+}));
 
-bot.command('cancel', async (ctx) => {
-  if (!allowed(ctx)) return ctx.reply('Not authorized.');
+bot.command('cancel', authGuard((ctx) => {
   const [, mint] = ctx.message.text.trim().split(/\s+/);
   if (!mint) return ctx.reply('Usage: /cancel <mint>');
   if (!positions[mint]) return ctx.reply('No such position.');
   delete positions[mint];
   savePositions();
   ctx.reply(`Canceled monitoring for ${mint}. (No auto-sell will trigger.)`);
-});
+}));
 
 // -------------------- MONITOR LOOP: TP/SL --------------------
 async function monitorPositions() {
@@ -442,7 +474,6 @@ async function monitorPositions() {
       if (entrySol <= 0) continue;
 
       const pnlPct = ((estSol - entrySol) / entrySol) * 100;
-
       positions[mint].lastCheck = now;
 
       const hitTP = pnlPct >= p.tpPct;
@@ -474,13 +505,12 @@ async function monitorPositions() {
               amountRaw: toSell,
               slippageBps: THIN.SLIPPAGE_BASE
             });
-            positions[mint].slPct = 0;
+            positions[mint].slPct = 0;               // move SL to breakeven
             positions[mint].tookPartialTP = true;
             savePositions();
-
             if (lastChatId) {
               bot.telegram.sendMessage(lastChatId,
-                `✅ Partial TP for ${mint} at ~${pnlPct.toFixed(2)}%\nSold 50%, moved SL to breakeven.\nRealized ~${(Number(outLamports)/1e9).toFixed(6)} SOL.`);
+                `✅ Partial TP for ${mint} at ~${pnlPct.toFixed(2)}%\nSold 50%, SL moved to breakeven.\nRealized ~${(Number(outLamports)/1e9).toFixed(6)} SOL.`);
             }
           }
           continue;
