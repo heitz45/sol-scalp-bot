@@ -1,6 +1,8 @@
 // bot.js — Fully-automated thin-liquidity SCALP bot for Solana
-// Features: Auth (DM/group), whoami/authstatus, sharded buys/sells, TP/SL,
-// Autopilot discovery (Dexscreener) with Telegram toggle & filter editing.
+// Features: Auth, whoami/authstatus, sharded buys/sells, TP/SL monitor,
+// Autopilot (Dexscreener) with Telegram toggle & filter editing,
+// Improved Dexscreener fetch (headers, timeout, retries, fallbacks),
+// Debug commands: /scan (force scan), /autosim (routing sanity).
 
 import 'dotenv/config';
 import fs from 'fs';
@@ -13,8 +15,6 @@ import {
   PublicKey,
   VersionedTransaction
 } from '@solana/web3.js';
-import crypto from 'crypto';
-import express from 'express'; // only used if you later switch to webhook mode
 
 // -------------------- ENV --------------------
 const {
@@ -38,7 +38,10 @@ const {
   AUTOPILOT_MIN_5M_BUY_TX = '20',
   AUTOPILOT_MIN_5M_PRICE_CHANGE_PCT = '4',
   AUTOPILOT_COOLDOWN_MIN = '30',
-  AUTOPILOT_BLACKLIST = ''
+  AUTOPILOT_BLACKLIST = '',
+
+  // Dexscreener base (override if needed)
+  DEXSCREENER_BASE = 'https://api.dexscreener.com'
 } = process.env;
 
 if (!WALLET_PRIVATE_KEY_BASE58) { console.error('Missing WALLET_PRIVATE_KEY_BASE58'); process.exit(1); }
@@ -77,7 +80,7 @@ const connection = new Connection(RPC_URL, 'confirmed');
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 
-// Hard-coded SCALP triggers (adjust in code if desired)
+// Hard-coded SCALP triggers
 const SCALP_TP_PCT = 20; // take profit +20%
 const SCALP_SL_PCT = 10; // stop loss -10%
 
@@ -331,7 +334,9 @@ bot.start(authGuard((ctx) => {
 /status
 /cancel <mint>
 /autopilot on|off|status
-/autofilters  (show/edit filters)
+/autofilters
+/scan
+/autosim <mint> [sol]
 
 Autopilot: ${AUTOPILOT.enabled ? 'ON' : 'OFF'}
 Wallet: ${keypair.publicKey.toBase58()}`
@@ -386,7 +391,7 @@ bot.command('autobuy', authGuard(async (ctx) => {
   try {
     await verifyMintExists(mint);
     const { outAmountRaw, totalSpentLamports, shardsExecuted } = await buyBySol({
-      mint, amountSol: sol, slippageBps: THIN.SLIPPAGE_BPS
+      mint, amountSol: sol, slippageBps: THIN.SLIPPAGE_BASE
     });
     positions[mint] = {
       mint,
@@ -506,6 +511,50 @@ blacklist add <MINT> | remove <MINT> | show`
   } catch (e) { return ctx.reply(`⚠️ ${e.message}`); }
 }));
 
+// -------------------- DEBUG COMMANDS --------------------
+// Force a scan now (does not buy; shows how many candidates)
+bot.command('scan', authGuard(async (ctx) => {
+  try {
+    const pairs = await fetchDexScreenerSolanaPairs();
+    ctx.reply(`[SCAN] fetched ${pairs.length} pairs. Filtering...`);
+    const cands = selectCandidates(pairs);
+    ctx.reply(`[SCAN] candidates=${cands.length}${cands.length? '\nTop: ' + cands.slice(0,5).join('\n') : ''}`);
+  } catch (e) {
+    ctx.reply(`[SCAN] error: ${e.message}`);
+  }
+}));
+
+// Try a tiny test route for a mint
+bot.command('autosim', authGuard(async (ctx) => {
+  const [, mint, solStr] = ctx.message.text.trim().split(/\s+/);
+  const testSol = Number(solStr || AUTOPILOT.budgetSol || 0.01);
+  if (!mint || !isFinite(testSol) || testSol <= 0) {
+    return ctx.reply('Usage: /autosim <MINT> [SOL]');
+  }
+  try {
+    await verifyMintExists(mint);
+    const lamports = Math.floor(Math.max(testSol, 0.005) * 1e9);
+    const buyRoute = await jupQuote({
+      inputMint: WSOL_MINT,
+      outputMint: mint,
+      amountRaw: lamports,
+      slippageBps: THIN.SLIPPAGE_BASE
+    });
+    const sellRoute = await jupQuote({
+      inputMint: mint,
+      outputMint: WSOL_MINT,
+      amountRaw: String(Math.max(1n, BigInt(buyRoute?.outAmount || 0) / 5n)),
+      slippageBps: THIN.SLIPPAGE_BASE
+    });
+    const impact = Number(buyRoute?.priceImpactPct ?? NaN);
+    ctx.reply(
+      `Autosim ✅\nMint: ${mint}\nIn: ${(lamports/1e9).toFixed(6)} SOL → OutRaw: ${buyRoute?.outAmount}\nPriceImpact: ${isFinite(impact)?impact.toFixed(2):'n/a'}%\nSellRouteOutLamports: ~${(Number(sellRoute?.outAmount||0)/1e9).toFixed(6)} SOL`
+    );
+  } catch (e) {
+    ctx.reply(`Autosim ❌ ${e.message}`);
+  }
+}));
+
 // -------------------- MONITOR LOOP: TP/SL --------------------
 async function monitorPositions() {
   const now = new Date().toISOString();
@@ -556,13 +605,72 @@ async function monitorPositions() {
 }
 setInterval(monitorPositions, Number(POLL_SECONDS) * 1000);
 
-// -------------------- AUTOPILOT: Dexscreener scan --------------------
-async function fetchDexScreenerSolanaPairs() {
-  const r = await fetch('https://api.dexscreener.com/latest/dex/pairs/solana');
-  if (!r.ok) throw new Error('Dexscreener fetch failed');
-  const data = await r.json();
-  return data?.pairs || [];
+// -------------------- DEXSCREENER FETCH (robust) --------------------
+async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
+  const url = `${DEXSCREENER_BASE}${path}`;
+  let lastErr;
+  for (let i = 1; i <= tries; i++) {
+    try {
+      const opts = {
+        headers: {
+          'User-Agent': 'sol-autopilot/1.0',
+          'Accept': 'application/json'
+        }
+      };
+      // Per-request timeout (Node 20+)
+      if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+        opts.signal = AbortSignal.timeout(15000);
+      }
+      const r = await fetch(url, opts);
+      if (!r.ok) {
+        const text = await r.text().catch(() => '');
+        throw new Error(`HTTP ${r.status} ${r.statusText} — ${text.slice(0, 200)}`);
+      }
+      return await r.json();
+    } catch (e) {
+      lastErr = e;
+      console.error(`[DEX] request failed (try ${i}/${tries}) ${url}:`, e.message);
+      await new Promise(res => setTimeout(res, 1000 * i));
+    }
+  }
+  throw lastErr;
 }
+
+async function fetchDexScreenerSolanaPairs() {
+  // Primary feed
+  try {
+    const data = await fetchDexscreenerJson('/latest/dex/pairs/solana', { tries: 3 });
+    if (Array.isArray(data?.pairs) && data.pairs.length) return data.pairs;
+    console.warn('[DEX] primary feed returned no pairs, falling back…');
+  } catch (e) {
+    console.error('[DEX] primary feed error:', e.message);
+  }
+
+  // Fallback #1: tokens feed
+  try {
+    const data2 = await fetchDexscreenerJson('/latest/dex/tokens/solana', { tries: 2 });
+    if (Array.isArray(data2?.pairs) && data2.pairs.length) return data2.pairs;
+    console.warn('[DEX] tokens feed returned no pairs, trying search fallback…');
+  } catch (e) {
+    console.error('[DEX] tokens feed error:', e.message);
+  }
+
+  // Fallback #2: search feed (filter to Solana in code)
+  try {
+    const data3 = await fetchDexscreenerJson('/latest/dex/search?q=solana', { tries: 2 });
+    const pairs = Array.isArray(data3?.pairs) ? data3.pairs.filter(p =>
+      p.chainId === 'solana' || /solana/i.test(p.chainId || '')
+    ) : [];
+    if (pairs.length) return pairs;
+    console.warn('[DEX] search fallback returned no pairs.');
+  } catch (e) {
+    console.error('[DEX] search fallback error:', e.message);
+  }
+
+  throw new Error('All Dexscreener endpoints failed');
+}
+
+// -------------------- AUTOPILOT: select + loop --------------------
 function selectCandidates(pairs) {
   const openCount = Object.keys(positions).length;
   const room = Math.max(0, AUTOPILOT.maxOpen - openCount);
@@ -571,30 +679,40 @@ function selectCandidates(pairs) {
   const now = Date.now();
   const ban = new Set(AUTOPILOT.blacklist);
 
+  // debugging counters
+  const drop = {
+    notSolana: 0, noBase: 0, blacklisted: 0,
+    liq: 0, vol5m: 0, buys5m: 0, chg5m: 0,
+    cooldown: 0, pass: 0
+  };
+
   const filtered = pairs
     .filter(p => {
       try {
         const isSolana = p.chainId === 'solana' || /solana/i.test(p.chainId || '');
-        if (!isSolana) return false;
+        if (!isSolana) { drop.notSolana++; return false; }
         const baseMint = p?.baseToken?.address;
-        if (!baseMint) return false;
-        if (ban.has(baseMint)) return false;
+        if (!baseMint) { drop.noBase++; return false; }
+        if (ban.has(baseMint)) { drop.blacklisted++; return false; }
 
-        const liqUsd = Number(p?.liquidity?.usd || 0);
-        const vol5m = Number(p?.volume?.m5 || 0);
-        const buys5m = Number(p?.txns?.m5?.buys || 0);
+        const liqUsd   = Number(p?.liquidity?.usd || 0);
+        const vol5m    = Number(p?.volume?.m5 || 0);
+        const buys5m   = Number(p?.txns?.m5?.buys || 0);
         const change5m = Number(p?.priceChange?.m5 || 0);
 
-        if (liqUsd < AUTOPILOT.minLiqUsd) return false;
-        if (vol5m < AUTOPILOT.minVol5m) return false;
-        if (buys5m < AUTOPILOT.minBuys5m) return false;
-        if (change5m < AUTOPILOT.minChange5m) return false;
+        if (liqUsd   < AUTOPILOT.minLiqUsd)      { drop.liq++; return false; }
+        if (vol5m    < AUTOPILOT.minVol5m)       { drop.vol5m++; return false; }
+        if (buys5m   < AUTOPILOT.minBuys5m)      { drop.buys5m++; return false; }
+        if (change5m < AUTOPILOT.minChange5m)    { drop.chg5m++; return false; }
 
-        const lastTry = AUTOPILOT.lastTried[baseMint] || 0;
-        if (now - lastTry < AUTOPILOT.cooldownMs) return false;
+        const baseLast = AUTOPILOT.lastTried[baseMint] || 0;
+        if (now - baseLast < AUTOPILOT.cooldownMs) { drop.cooldown++; return false; }
 
+        drop.pass++;
         return true;
-      } catch { return false; }
+      } catch {
+        return false;
+      }
     })
     .map(p => {
       const baseMint = p.baseToken.address;
@@ -606,6 +724,12 @@ function selectCandidates(pairs) {
     })
     .sort((a, b) => b.score - a.score);
 
+  console.log('[AUTO] drop stats', {
+    notSolana: drop.notSolana, noBase: drop.noBase, blacklisted: drop.blacklisted,
+    liq: drop.liq, vol5m: drop.vol5m, buys5m: drop.buys5m, chg5m: drop.chg5m,
+    perMintCooldown: drop.cooldown, pass: drop.pass
+  });
+
   const picks = [];
   for (const { baseMint } of filtered) {
     if (picks.length >= room) break;
@@ -614,13 +738,26 @@ function selectCandidates(pairs) {
   }
   return picks;
 }
+
 async function autopilotLoop() {
   if (!AUTOPILOT.enabled) return;
   try {
     if (Date.now() - AUTOPILOT.lastBuyAt < AUTOPILOT.cooldownMs) return;
 
     const pairs = await fetchDexScreenerSolanaPairs();
+    console.log(`[AUTO] fetched pairs: ${pairs.length}`);
+
     const candidates = selectCandidates(pairs);
+    console.log(`[AUTO] candidates after filters: ${candidates.length}`, {
+      minLiqUsd: AUTOPILOT.minLiqUsd,
+      minVol5m: AUTOPILOT.minVol5m,
+      minBuys5m: AUTOPILOT.minBuys5m,
+      minChange5m: AUTOPILOT.minChange5m,
+      maxOpen: AUTOPILOT.maxOpen,
+      open: Object.keys(positions).length,
+      budgetSol: AUTOPILOT.budgetSol
+    });
+
     if (!candidates.length) return;
 
     for (const mint of candidates) {
@@ -663,8 +800,19 @@ async function autopilotLoop() {
 setInterval(autopilotLoop, 60 * 1000);
 
 // -------------------- SAFE LONG-POLLING START --------------------
+async function assertTelegramToken() {
+  try {
+    const me = await bot.telegram.getMe();
+    console.log(`Telegram token OK. Connected as @${me.username} (id=${me.id}).`);
+  } catch (e) {
+    console.error('Invalid TELEGRAM_BOT_TOKEN (401). In @BotFather: /revoke then /token. Update env and redeploy.');
+    process.exit(1);
+  }
+}
+
 async function resetWebhookAndLaunch() {
   try {
+    await assertTelegramToken();
     await bot.telegram.deleteWebhook({ drop_pending_updates: true });
     await bot.launch();
     console.log(`Bot launched with long polling. Wallet: ${keypair.publicKey.toBase58()}`);
