@@ -144,8 +144,18 @@ function saveAutopilotCfg() { fs.writeFileSync(AUTOPILOT_CFG_FILE, JSON.stringif
 const AUTOPILOT = loadAutopilotCfg();
 
 // -------------------- JUPITER HELPERS --------------------
+// Prefer direct Jupiter; fall back to your Worker if the edge blocks us
 const WORKER_JUP = (process.env.JUPITER_BASE || '').replace(/\/$/, ''); // e.g. https://<worker>.workers.dev/jup
 const JUP_DIRECT = 'https://quote-api.jup.ag';
+
+// Headers that look like a normal browser request (helps avoid 530/1016)
+const JUP_HEADERS = {
+  'Accept': 'application/json',
+  'User-Agent': 'Mozilla/5.0',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Origin': 'https://jup.ag',
+  'Referer': 'https://jup.ag/'
+};
 
 function buildUrl(base, path) {
   const b = base.endsWith('/') ? base.slice(0, -1) : base;
@@ -158,13 +168,19 @@ async function fetchJsonTry(bases, path, init = {}) {
     if (!base) continue;
     try {
       const url = buildUrl(base, path);
-      const r = await fetch(url, { headers: { 'Accept': 'application/json' }, ...init });
+      const r = await fetch(url, {
+        // Merge our browser-y headers with any custom init.headers
+        headers: { ...JUP_HEADERS, ...(init.headers || {}) },
+        ...init
+      });
       if (!r.ok) {
         const text = await r.text().catch(() => '');
-        // If 5xx (incl. 530), try next base
+        // On 5xx (includes 530), try the next base
         if (r.status >= 500) { lastErr = new Error(`(${r.status}) ${text.slice(0,180)}`); continue; }
+        // 4xx etc: surface immediately (usually a real API error)
         throw new Error(`(${r.status} ${r.statusText}) ${text.slice(0,180)}`);
       }
+      // Parse JSON; if edge returns HTML, this will throw and we’ll try next base
       return await r.json();
     } catch (e) {
       lastErr = e;
@@ -181,7 +197,7 @@ async function jupQuote({ inputMint, outputMint, amountRaw, slippageBps }) {
   qs.set('slippageBps', String(slippageBps));
   qs.set('onlyDirectRoutes', 'false');
 
-  // Try DIRECT first (with our DNS settings), then Worker as fallback
+  // Try DIRECT first (with hardened DNS), then Worker
   const data = await fetchJsonTry([JUP_DIRECT, WORKER_JUP], `/v6/quote?${qs.toString()}`);
   if (!data?.data?.[0]) throw new Error('No route');
   return data.data[0];
