@@ -140,21 +140,32 @@ function saveAutopilotCfg() { fs.writeFileSync(AUTOPILOT_CFG_FILE, JSON.stringif
 const AUTOPILOT = loadAutopilotCfg();
 
 // -------------------- JUPITER HELPERS --------------------
+const JUPITER_BASE = process.env.JUPITER_BASE || 'https://quote-api.jup.ag';
+
 async function jupQuote({ inputMint, outputMint, amountRaw, slippageBps }) {
-  const url = new URL('https://quote-api.jup.ag/v6/quote');
+  // Build URL for Jupiter (or your worker)
+  const url = new URL(`${JUPITER_BASE}/v6/quote`);
   url.searchParams.set('inputMint', inputMint);
   url.searchParams.set('outputMint', outputMint);
   url.searchParams.set('amount', String(amountRaw));
   url.searchParams.set('slippageBps', String(slippageBps));
   url.searchParams.set('onlyDirectRoutes', 'false');
-  const r = await fetch(url);
-  if (!r.ok) throw new Error('Quote failed');
+
+  // Fetch the route data
+  const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    throw new Error(`Quote failed (${r.status} ${r.statusText}) — ${text.slice(0, 180)}`);
+  }
+
   const data = await r.json();
-  if (!data?.data?.[0]) throw new Error('No route');
+  if (!data?.data?.[0]) throw new Error('No route returned from Jupiter');
   return data.data[0];
 }
+
 async function jupBuildAndSend({ quoteResponse }) {
-  const res = await fetch('https://quote-api.jup.ag/v6/swap', {
+  // Build and send the Jupiter swap transaction (via worker if defined)
+  const res = await fetch(`${JUPITER_BASE}/v6/swap`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -164,15 +175,23 @@ async function jupBuildAndSend({ quoteResponse }) {
       dynamicComputeUnitLimit: true
     })
   });
-  if (!res.ok) throw new Error('Swap build failed');
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Swap build failed (${res.status} ${res.statusText}) — ${text.slice(0, 180)}`);
+  }
+
+  // Deserialize and send
   const { swapTransaction } = await res.json();
   const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
   tx.sign([keypair]);
+
   const sig = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 });
   const conf = await connection.confirmTransaction(sig, 'confirmed');
   if (conf.value.err) throw new Error(`Swap failed: ${JSON.stringify(conf.value.err)}`);
   return sig;
 }
+
 function extractImpactPct(route) {
   if (route?.priceImpactPct != null) return Number(route.priceImpactPct);
   return NaN;
