@@ -16,7 +16,7 @@ import {
   VersionedTransaction
 } from '@solana/web3.js';
 
-// -------------------- ENV --------------------
+// at the very top of bot.js (after imports)
 const {
   RPC_URL = 'https://api.mainnet-beta.solana.com',
   WALLET_PRIVATE_KEY_BASE58,
@@ -38,7 +38,9 @@ const {
   AUTOPILOT_MIN_5M_BUY_TX = '20',
   AUTOPILOT_MIN_5M_PRICE_CHANGE_PCT = '4',
   AUTOPILOT_COOLDOWN_MIN = '30',
-  AUTOPILOT_BLACKLIST = '',
+  AUTOPILOT_BLACKLIST = ''
+} = process.env;   // ←←← CLOSE the destructure and end with a semicolon
+// ^^^^^^^^^^^^^^^^ very important line
 
 if (!WALLET_PRIVATE_KEY_BASE58) { console.error('Missing WALLET_PRIVATE_KEY_BASE58'); process.exit(1); }
 if (!TELEGRAM_BOT_TOKEN) { console.error('Missing TELEGRAM_BOT_TOKEN'); process.exit(1); }
