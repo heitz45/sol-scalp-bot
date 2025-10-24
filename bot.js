@@ -9,15 +9,15 @@ import fs from 'fs';
 import fetch from 'node-fetch';
 import bs58 from 'bs58';
 import { Telegraf } from 'telegraf';
-mport {
+import {
   Connection,
   Keypair,
   PublicKey,
   VersionedTransaction
 } from '@solana/web3.js';
 
-import dns from 'node:dns';
-dns.setDefaultResultOrder('ipv4first');
+import dns from 'node:dns';              // ← add (or keep) this
+dns.setDefaultResultOrder('ipv4first');  // ← and this
 
 // at the very top of bot.js (after imports)
 const {
@@ -143,49 +143,64 @@ function saveAutopilotCfg() { fs.writeFileSync(AUTOPILOT_CFG_FILE, JSON.stringif
 const AUTOPILOT = loadAutopilotCfg();
 
 // -------------------- JUPITER HELPERS --------------------
+// -------------------- JUPITER HELPERS --------------------
 const JUPITER_BASE = process.env.JUPITER_BASE || 'https://quote-api.jup.ag';
 
-async function jupQuote({ inputMint, outputMint, amountRaw, slippageBps }) {
-  // Build URL for Jupiter (or your worker)
-  const url = new URL(`${JUPITER_BASE}/v6/quote`);
-  url.searchParams.set('inputMint', inputMint);
-  url.searchParams.set('outputMint', outputMint);
-  url.searchParams.set('amount', String(amountRaw));
-  url.searchParams.set('slippageBps', String(slippageBps));
-  url.searchParams.set('onlyDirectRoutes', 'false');
+function buildJupUrl(base, path) {
+  const b = base.endsWith('/') ? base.slice(0, -1) : base;
+  return `${b}${path.startsWith('/') ? '' : '/'}${path}`;
+}
 
-  // Fetch the route data
-  const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
-  if (!r.ok) {
-    const text = await r.text().catch(() => '');
-    throw new Error(`Quote failed (${r.status} ${r.statusText}) — ${text.slice(0, 180)}`);
+async function fetchJsonWithFallback(path, init = {}) {
+  const bases = [JUPITER_BASE, 'https://quote-api.jup.ag'];
+  let lastErr;
+  for (const base of bases) {
+    try {
+      const url = buildJupUrl(base, path);
+      const r = await fetch(url, { headers: { 'Accept': 'application/json' }, ...init });
+      if (!r.ok) {
+        const text = await r.text().catch(() => '');
+        if (r.status >= 500) { lastErr = new Error(`(${r.status}) ${text.slice(0,180)}`); continue; }
+        throw new Error(`(${r.status} ${r.statusText}) ${text.slice(0,180)}`);
+      }
+      return await r.json();
+    } catch (e) {
+      lastErr = e;
+    }
   }
+  throw new Error(`Jupiter request failed on all bases: ${lastErr?.message || lastErr}`);
+}
 
-  const data = await r.json();
-  if (!data?.data?.[0]) throw new Error('No route returned from Jupiter');
+async function jupQuote({ inputMint, outputMint, amountRaw, slippageBps }) {
+  const params = new URLSearchParams();
+  params.set('inputMint', inputMint);
+  params.set('outputMint', outputMint);
+  params.set('amount', String(amountRaw));
+  params.set('slippageBps', String(slippageBps));
+  params.set('onlyDirectRoutes', 'false');
+
+  const data = await fetchJsonWithFallback(`/v6/quote?${params.toString()}`);
+  if (!data?.data?.[0]) throw new Error('No route');
   return data.data[0];
 }
 
 async function jupBuildAndSend({ quoteResponse }) {
-  // Build and send the Jupiter swap transaction (via worker if defined)
-  const res = await fetch(`${JUPITER_BASE}/v6/swap`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      quoteResponse,
-      userPublicKey: keypair.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true
-    })
+  const body = JSON.stringify({
+    quoteResponse,
+    userPublicKey: keypair.publicKey.toBase58(),
+    wrapAndUnwrapSol: true,
+    dynamicComputeUnitLimit: true
   });
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Swap build failed (${res.status} ${res.statusText}) — ${text.slice(0, 180)}`);
-  }
+  const data = await fetchJsonWithFallback('/v6/swap', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body
+  });
 
-  // Deserialize and send
-  const { swapTransaction } = await res.json();
+  const { swapTransaction } = data;
+  if (!swapTransaction) throw new Error('No swapTransaction in response');
+
   const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
   tx.sign([keypair]);
 
