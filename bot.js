@@ -618,19 +618,14 @@ async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
     'https://graph.dexscreener.services',
     'https://api.dexscreener.com'
   ];
-  // De-dup just in case env equals one of the fallbacks
   bases = [...new Set(bases)];
-
   let lastErr;
   for (const base of bases) {
     const url = `${base}${path}`;
     for (let i = 1; i <= tries; i++) {
       try {
         const opts = {
-          headers: {
-            'User-Agent': 'sol-autopilot/1.0',
-            'Accept': 'application/json'
-          }
+          headers: { 'User-Agent': 'sol-autopilot/1.0', 'Accept': 'application/json' }
         };
         if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
           opts.signal = AbortSignal.timeout(15000);
@@ -639,7 +634,6 @@ async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
         const r = await fetch(url, opts);
         if (!r.ok) {
           const text = await r.text().catch(() => '');
-          // On explicit 403/404, break inner loop and try the next base
           if (r.status === 403 || r.status === 404) {
             console.warn(`[DEX] ${r.status} at ${url} — switching base…`);
             break;
@@ -657,8 +651,41 @@ async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
   throw lastErr || new Error('All Dexscreener bases failed');
 }
 
+// ⬇️ INSERT THIS ENTIRE BLOCK RIGHT HERE
+
+// -------------------- DEXSCREENER: get Solana pairs via search --------------------
+async function fetchDexscreenerSolanaPairs() {
+  try {
+    const queries = ['chain:solana', 'solana raydium', 'solana orca'];
+    for (const q of queries) {
+      const data = await fetchDexscreenerJson(
+        `/latest/dex/search?q=${encodeURIComponent(q)}`,
+        { tries: 3 }
+      );
+
+      const pairs = Array.isArray(data?.pairs)
+        ? data.pairs.filter(p =>
+            p?.chainId === 'solana' || /solana/i.test(p?.chainId || '')
+          )
+        : [];
+
+      if (pairs.length) return pairs;
+      console.warn(`[DEX] search "${q}" returned 0 pairs, trying next…`);
+    }
+  } catch (e) {
+    console.error('[DEX] search error:', e.message);
+  }
+  throw new Error('Dexscreener search returned no pairs');
+}
+
+// alias for code that calls fetchDexScreenerSolanaPairs()
+const fetchDexScreenerSolanaPairs = fetchDexscreenerSolanaPairs;
+
+// ⬆️ stop pasting here
+
 // -------------------- AUTOPILOT: select + loop --------------------
 function selectCandidates(pairs) {
+  // ... rest of your file continues ...
   const openCount = Object.keys(positions).length;
   const room = Math.max(0, AUTOPILOT.maxOpen - openCount);
   if (room === 0) return [];
