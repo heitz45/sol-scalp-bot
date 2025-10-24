@@ -612,72 +612,49 @@ const DEXSCREENER_BASE =
   'https://api.raydium.io/dexscreener'; // mirror avoids 403s from api.dexscreener.com
 
 async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
-  let url = `${DEXSCREENER_BASE}${path}`;
+  // Start from env or raydium mirror; we’ll auto-swap on errors
+  let bases = [
+    (process.env.DEXSCREENER_BASE || 'https://api.raydium.io/dexscreener'),
+    'https://graph.dexscreener.services',
+    'https://api.dexscreener.com'
+  ];
+  // De-dup just in case env equals one of the fallbacks
+  bases = [...new Set(bases)];
+
   let lastErr;
-
-  for (let i = 1; i <= tries; i++) {
-    try {
-      const opts = {
-        headers: {
-          'User-Agent': 'sol-autopilot/1.0 (+https://example.com)',
-          'Accept': 'application/json'
+  for (const base of bases) {
+    const url = `${base}${path}`;
+    for (let i = 1; i <= tries; i++) {
+      try {
+        const opts = {
+          headers: {
+            'User-Agent': 'sol-autopilot/1.0',
+            'Accept': 'application/json'
+          }
+        };
+        if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+          opts.signal = AbortSignal.timeout(15000);
         }
-      };
-      if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
-        opts.signal = AbortSignal.timeout(15000);
-      }
 
-      const r = await fetch(url, opts);
-      if (!r.ok) {
-        const text = await r.text().catch(() => '');
-        // If the main API returns 403, switch to fallback mirror once
-        if (r.status === 403 && !url.includes('graph.dexscreener.services')) {
-          console.warn('[DEX] 403 Forbidden — switching to fallback mirror');
-          url = `https://graph.dexscreener.services${path}`;
-          continue;
+        const r = await fetch(url, opts);
+        if (!r.ok) {
+          const text = await r.text().catch(() => '');
+          // On explicit 403/404, break inner loop and try the next base
+          if (r.status === 403 || r.status === 404) {
+            console.warn(`[DEX] ${r.status} at ${url} — switching base…`);
+            break;
+          }
+          throw new Error(`HTTP ${r.status} ${r.statusText} — ${text.slice(0, 200)}`);
         }
-        throw new Error(`HTTP ${r.status} ${r.statusText} — ${text.slice(0, 200)}`);
+        return await r.json();
+      } catch (e) {
+        lastErr = e;
+        console.error(`[DEX] request failed (try ${i}/${tries}) ${url}:`, e.message);
+        await new Promise(res => setTimeout(res, 1000 * i));
       }
-      return await r.json();
-    } catch (e) {
-      lastErr = e;
-      console.error(`[DEX] request failed (try ${i}/${tries}) ${url}:`, e.message);
-      await new Promise(res => setTimeout(res, 1000 * i));
     }
   }
-
-  throw lastErr;
-}
-
-/**
- * Dexscreener does NOT expose "list all pairs by chain" — use search:
- *   /latest/dex/search?q=chain:solana
- * We chain a few Solana-centric queries to broaden coverage a bit.
- */
-async function fetchDexScreenerSolanaPairs() {
-  try {
-    const queries = [
-      'chain:solana',
-      'solana raydium',
-      'solana orca'
-    ];
-    for (const q of queries) {
-      const data = await fetchDexscreenerJson(
-        `/latest/dex/search?q=${encodeURIComponent(q)}`,
-        { tries: 3 }
-      );
-      const pairs = Array.isArray(data?.pairs)
-        ? data.pairs.filter(
-            (p) => p.chainId === 'solana' || /solana/i.test(p.chainId || '')
-          )
-        : [];
-      if (pairs.length) return pairs;
-      console.warn(`[DEX] search "${q}" returned 0 pairs, trying next…`);
-    }
-  } catch (e) {
-    console.error('[DEX] search error:', e.message);
-  }
-  throw new Error('Dexscreener search returned no pairs');
+  throw lastErr || new Error('All Dexscreener bases failed');
 }
 
 // -------------------- AUTOPILOT: select + loop --------------------
