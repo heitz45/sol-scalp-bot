@@ -16,8 +16,9 @@ import {
   VersionedTransaction
 } from '@solana/web3.js';
 
-import dns from 'node:dns';              // ← add (or keep) this
-dns.setDefaultResultOrder('ipv4first');  // ← and this
+import dns from 'node:dns';
+dns.setDefaultResultOrder('ipv4first');
+dns.setServers(['1.1.1.1', '8.8.8.8']); // Cloudflare + Google DNS
 
 // at the very top of bot.js (after imports)
 const {
