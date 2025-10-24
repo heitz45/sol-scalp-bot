@@ -144,56 +144,65 @@ function saveAutopilotCfg() { fs.writeFileSync(AUTOPILOT_CFG_FILE, JSON.stringif
 const AUTOPILOT = loadAutopilotCfg();
 
 // -------------------- JUPITER HELPERS --------------------
-// Require the Worker; do not fall back to direct jup.ag (prevents ENOTFOUND)
-const JUPITER_BASE = process.env.JUPITER_BASE;
-if (!JUPITER_BASE) {
-  throw new Error('Missing JUPITER_BASE env var (must point to your CF Worker, e.g. https://<worker>.workers.dev/jup)');
+const WORKER_JUP = (process.env.JUPITER_BASE || '').replace(/\/$/, ''); // e.g. https://<worker>.workers.dev/jup
+const JUP_DIRECT = 'https://quote-api.jup.ag';
+
+function buildUrl(base, path) {
+  const b = base.endsWith('/') ? base.slice(0, -1) : base;
+  return `${b}${path.startsWith('/') ? '' : '/'}${path}`;
 }
 
-function buildJupUrl(path) {
-  const base = JUPITER_BASE.endsWith('/') ? JUPITER_BASE.slice(0, -1) : JUPITER_BASE;
-  return `${base}${path.startsWith('/') ? '' : '/'}${path}`;
+async function fetchJsonTry(bases, path, init = {}) {
+  let lastErr;
+  for (const base of bases) {
+    if (!base) continue;
+    try {
+      const url = buildUrl(base, path);
+      const r = await fetch(url, { headers: { 'Accept': 'application/json' }, ...init });
+      if (!r.ok) {
+        const text = await r.text().catch(() => '');
+        // If 5xx (incl. 530), try next base
+        if (r.status >= 500) { lastErr = new Error(`(${r.status}) ${text.slice(0,180)}`); continue; }
+        throw new Error(`(${r.status} ${r.statusText}) ${text.slice(0,180)}`);
+      }
+      return await r.json();
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(`Jupiter request failed on all bases: ${lastErr?.message || lastErr}`);
 }
 
 async function jupQuote({ inputMint, outputMint, amountRaw, slippageBps }) {
-  const params = new URLSearchParams();
-  params.set('inputMint', inputMint);
-  params.set('outputMint', outputMint);
-  params.set('amount', String(amountRaw));
-  params.set('slippageBps', String(slippageBps));
-  params.set('onlyDirectRoutes', 'false');
+  const qs = new URLSearchParams();
+  qs.set('inputMint', inputMint);
+  qs.set('outputMint', outputMint);
+  qs.set('amount', String(amountRaw));
+  qs.set('slippageBps', String(slippageBps));
+  qs.set('onlyDirectRoutes', 'false');
 
-  const url = buildJupUrl(`/v6/quote?${params.toString()}`);
-
-  const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
-  if (!r.ok) {
-    const text = await r.text().catch(() => '');
-    throw new Error(`Quote failed via worker (${r.status} ${r.statusText}) — ${text.slice(0,180)}`);
-  }
-  const data = await r.json().catch(() => {
-    throw new Error('Worker returned non-JSON for quote');
-  });
+  // Try DIRECT first (with our DNS settings), then Worker as fallback
+  const data = await fetchJsonTry([JUP_DIRECT, WORKER_JUP], `/v6/quote?${qs.toString()}`);
   if (!data?.data?.[0]) throw new Error('No route');
   return data.data[0];
 }
 
 async function jupBuildAndSend({ quoteResponse }) {
-  const url = buildJupUrl('/v6/swap');
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify({
-      quoteResponse,
-      userPublicKey: keypair.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true
-    })
+  const body = JSON.stringify({
+    quoteResponse,
+    userPublicKey: keypair.publicKey.toBase58(),
+    wrapAndUnwrapSol: true,
+    dynamicComputeUnitLimit: true
   });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Swap build failed via worker (${res.status} ${res.statusText}) — ${text.slice(0,180)}`);
-  }
-  const { swapTransaction } = await res.json();
+
+  // Try DIRECT first, then Worker
+  const data = await fetchJsonTry(
+    [JUP_DIRECT, WORKER_JUP],
+    '/v6/swap',
+    { method: 'POST', headers: { 'content-type': 'application/json' }, body }
+  );
+
+  const { swapTransaction } = data;
   if (!swapTransaction) throw new Error('No swapTransaction in response');
 
   const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
