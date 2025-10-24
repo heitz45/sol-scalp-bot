@@ -1,20 +1,17 @@
 {
-  "name": "sol-auto-swap",
+  "name": "solana-autopilot-bot",
   "version": "1.0.0",
-  "description": "Autopilot Solana scalp bot (Telegraf + Jupiter) with Dexscreener discovery",
-  "license": "MIT",
+  "description": "Autonomous Solana trading bot with Telegram integration",
+  "main": "bot.js",
   "type": "module",
-  "engines": { "node": ">=20" },
   "scripts": {
-    "start": "node bot.js",
-    "dev": "NODE_ENV=development node bot.js"
+    "start": "node bot.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.95.3",
-    "bs58": "^6.0.0",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "@solana/web3.js": "^1.95.0",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.0.3",
     "node-fetch": "^3.3.2",
-    "telegraf": "^4.16.3"
+    "telegraf": "^4.15.0"
   }
 }
