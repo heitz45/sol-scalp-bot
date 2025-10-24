@@ -9,12 +9,15 @@ import fs from 'fs';
 import fetch from 'node-fetch';
 import bs58 from 'bs58';
 import { Telegraf } from 'telegraf';
-import {
+mport {
   Connection,
   Keypair,
   PublicKey,
   VersionedTransaction
 } from '@solana/web3.js';
+
+import dns from 'node:dns';
+dns.setDefaultResultOrder('ipv4first');
 
 // at the very top of bot.js (after imports)
 const {
@@ -624,20 +627,14 @@ setInterval(monitorPositions, Number(POLL_SECONDS) * 1000);
 
 // -------------------- DEXSCREENER FETCH via SEARCH (with mirror fallback) --------------------
 
-// Default base API. You can override via Render env var:
-// DEXSCREENER_BASE=https://api.raydium.io/dexscreener
-const DEXSCREENER_BASE =
-  process.env.DEXSCREENER_BASE ||
-  'https://api.raydium.io/dexscreener'; // mirror avoids 403s from api.dexscreener.com
-
 async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
-  // Start from env or raydium mirror; we’ll auto-swap on errors
+  // Try your Worker first, then official API
+  const envBase = (process.env.DEXSCREENER_BASE || '').replace(/\/$/, '');
   let bases = [
-    (process.env.DEXSCREENER_BASE || 'https://api.raydium.io/dexscreener'),
-    'https://graph.dexscreener.services',
-    'https://api.dexscreener.com'
-  ];
-  bases = [...new Set(bases)];
+    envBase,                          // e.g. https://old-resonance-6acd.heitertluke.workers.dev/ds
+    'https://api.dexscreener.com'     // fallback
+  ].filter(Boolean);
+
   let lastErr;
   for (const base of bases) {
     const url = `${base}${path}`;
@@ -653,6 +650,7 @@ async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
         const r = await fetch(url, opts);
         if (!r.ok) {
           const text = await r.text().catch(() => '');
+          // On explicit 403/404, switch to next base
           if (r.status === 403 || r.status === 404) {
             console.warn(`[DEX] ${r.status} at ${url} — switching base…`);
             break;
