@@ -143,32 +143,15 @@ function saveAutopilotCfg() { fs.writeFileSync(AUTOPILOT_CFG_FILE, JSON.stringif
 const AUTOPILOT = loadAutopilotCfg();
 
 // -------------------- JUPITER HELPERS --------------------
-// -------------------- JUPITER HELPERS --------------------
-const JUPITER_BASE = process.env.JUPITER_BASE || 'https://quote-api.jup.ag';
-
-function buildJupUrl(base, path) {
-  const b = base.endsWith('/') ? base.slice(0, -1) : base;
-  return `${b}${path.startsWith('/') ? '' : '/'}${path}`;
+// Require the Worker; do not fall back to direct jup.ag (prevents ENOTFOUND)
+const JUPITER_BASE = process.env.JUPITER_BASE;
+if (!JUPITER_BASE) {
+  throw new Error('Missing JUPITER_BASE env var (must point to your CF Worker, e.g. https://<worker>.workers.dev/jup)');
 }
 
-async function fetchJsonWithFallback(path, init = {}) {
-  const bases = [JUPITER_BASE, 'https://quote-api.jup.ag'];
-  let lastErr;
-  for (const base of bases) {
-    try {
-      const url = buildJupUrl(base, path);
-      const r = await fetch(url, { headers: { 'Accept': 'application/json' }, ...init });
-      if (!r.ok) {
-        const text = await r.text().catch(() => '');
-        if (r.status >= 500) { lastErr = new Error(`(${r.status}) ${text.slice(0,180)}`); continue; }
-        throw new Error(`(${r.status} ${r.statusText}) ${text.slice(0,180)}`);
-      }
-      return await r.json();
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw new Error(`Jupiter request failed on all bases: ${lastErr?.message || lastErr}`);
+function buildJupUrl(path) {
+  const base = JUPITER_BASE.endsWith('/') ? JUPITER_BASE.slice(0, -1) : JUPITER_BASE;
+  return `${base}${path.startsWith('/') ? '' : '/'}${path}`;
 }
 
 async function jupQuote({ inputMint, outputMint, amountRaw, slippageBps }) {
@@ -179,26 +162,37 @@ async function jupQuote({ inputMint, outputMint, amountRaw, slippageBps }) {
   params.set('slippageBps', String(slippageBps));
   params.set('onlyDirectRoutes', 'false');
 
-  const data = await fetchJsonWithFallback(`/v6/quote?${params.toString()}`);
+  const url = buildJupUrl(`/v6/quote?${params.toString()}`);
+
+  const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    throw new Error(`Quote failed via worker (${r.status} ${r.statusText}) — ${text.slice(0,180)}`);
+  }
+  const data = await r.json().catch(() => {
+    throw new Error('Worker returned non-JSON for quote');
+  });
   if (!data?.data?.[0]) throw new Error('No route');
   return data.data[0];
 }
 
 async function jupBuildAndSend({ quoteResponse }) {
-  const body = JSON.stringify({
-    quoteResponse,
-    userPublicKey: keypair.publicKey.toBase58(),
-    wrapAndUnwrapSol: true,
-    dynamicComputeUnitLimit: true
-  });
-
-  const data = await fetchJsonWithFallback('/v6/swap', {
+  const url = buildJupUrl('/v6/swap');
+  const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body
+    headers: { 'content-type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify({
+      quoteResponse,
+      userPublicKey: keypair.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true
+    })
   });
-
-  const { swapTransaction } = data;
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Swap build failed via worker (${res.status} ${res.statusText}) — ${text.slice(0,180)}`);
+  }
+  const { swapTransaction } = await res.json();
   if (!swapTransaction) throw new Error('No swapTransaction in response');
 
   const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
