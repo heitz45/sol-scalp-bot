@@ -83,8 +83,8 @@ const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 
 // Hard-coded SCALP triggers
-const SCALP_TP_PCT = 20; // take profit +20%
-const SCALP_SL_PCT = 10; // stop loss -10%
+const SCALP_TP_PCT = 5;   // take profit +5%
+const SCALP_SL_PCT = 1.5; // stop loss -1.5%
 
 // Thin-liquidity tuning (env-driven caps)
 const THIN = {
