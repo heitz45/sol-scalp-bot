@@ -745,36 +745,6 @@ async function fetchDexScreenerSolanaPairs() {
   return all.slice(0, DEX_MAX_RESULTS);
 }
 
-// -------------------- DEXSCREENER: get Solana pairs via search --------------------
-async function fetchDexscreenerSolanaPairs() {
-  try {
-    const queries = ['chain:solana', 'solana raydium', 'solana orca'];
-    for (const q of queries) {
-      const data = await fetchDexscreenerJson(
-        `/latest/dex/search?q=${encodeURIComponent(q)}`,
-        { tries: 3 }
-      );
-
-      const pairs = Array.isArray(data?.pairs)
-        ? data.pairs.filter(p =>
-            p?.chainId === 'solana' || /solana/i.test(p?.chainId || '')
-          )
-        : [];
-
-      if (pairs.length) return pairs;
-      console.warn(`[DEX] search "${q}" returned 0 pairs, trying next…`);
-    }
-  } catch (e) {
-    console.error('[DEX] search error:', e.message);
-  }
-  throw new Error('Dexscreener search returned no pairs');
-}
-
-// alias for code that calls fetchDexScreenerSolanaPairs()
-const fetchDexScreenerSolanaPairs = fetchDexscreenerSolanaPairs;
-
-// ⬆️ stop pasting here
-
 // -------------------- AUTOPILOT: select + loop --------------------
 function selectCandidates(pairs) {
   // ... rest of your file continues ...
