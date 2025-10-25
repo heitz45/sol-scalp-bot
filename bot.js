@@ -672,6 +672,78 @@ async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
 }
 
 // ⬇️ INSERT THIS ENTIRE BLOCK RIGHT HERE
+// -------------------- DEXSCREENER: wide fan-out search & merge --------------------
+const DEX_MAX_RESULTS = Number(process.env.DEX_MAX_RESULTS || '200');
+
+// Build query seeds (base + optional from env)
+function buildSearchSeeds() {
+  const fromEnv = (process.env.AUTOPILOT_SEARCH_SEEDS || '').split(',')
+    .map(s => s.trim()).filter(Boolean);
+  if (fromEnv.length) return fromEnv;
+
+  const base = [
+    'chain:solana',
+    'solana raydium',
+    'solana orca',
+    'pump solana',
+    'memecoin solana',
+    'bonk',
+    'wif',
+    'pepe',
+    'cat',
+    'dog',
+  ];
+
+  const letters = 'abcdefghijklmnopqrstuvwxyz'.split('');
+  const alpha = letters.slice(0, 10).map(l => `solana ${l}`);
+  return [...base, ...alpha];
+}
+
+async function dsSearch(q) {
+  const path = `/latest/dex/search?q=${encodeURIComponent(q)}`;
+  try {
+    const data = await fetchDexscreenerJson(path, { tries: 2 });
+    const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
+    return pairs.filter(p => p?.chainId === 'solana' || /solana/i.test(p?.chainId || ''));
+  } catch (e) {
+    console.warn(`[DEX] seed "${q}" failed: ${e.message}`);
+    return [];
+  }
+}
+
+async function fetchDexScreenerSolanaPairs() {
+  const seeds = buildSearchSeeds();
+  const BATCH = 5;
+  const merged = new Map();
+
+  for (let i = 0; i < seeds.length; i += BATCH) {
+    const chunk = seeds.slice(i, i + BATCH);
+    const results = await Promise.allSettled(chunk.map(q => dsSearch(q)));
+
+    for (const r of results) {
+      if (r.status !== 'fulfilled') continue;
+      for (const p of r.value) {
+        const baseMint = p?.baseToken?.address;
+        if (!baseMint) continue;
+        if (!merged.has(baseMint)) {
+          merged.set(baseMint, p);
+        } else {
+          const old = merged.get(baseMint);
+          const oldScore = Number(old?.volume?.m5 || 0) + Number(old?.liquidity?.usd || 0)/10;
+          const newScore = Number(p?.volume?.m5 || 0) + Number(p?.liquidity?.usd || 0)/10;
+          if (newScore > oldScore) merged.set(baseMint, p);
+        }
+      }
+    }
+
+    if (merged.size >= DEX_MAX_RESULTS) break;
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  const all = Array.from(merged.values());
+  console.log(`[DEX] aggregated pairs=${all.length} from seeds=${seeds.length} (cap=${DEX_MAX_RESULTS})`);
+  return all.slice(0, DEX_MAX_RESULTS);
+}
 
 // -------------------- DEXSCREENER: get Solana pairs via search --------------------
 async function fetchDexscreenerSolanaPairs() {
