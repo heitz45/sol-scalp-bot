@@ -144,86 +144,54 @@ function saveAutopilotCfg() { fs.writeFileSync(AUTOPILOT_CFG_FILE, JSON.stringif
 const AUTOPILOT = loadAutopilotCfg();
 
 // -------------------- JUPITER HELPERS --------------------
-// Prefer direct Jupiter; fall back to your Worker if the edge blocks us
-const WORKER_JUP = (process.env.JUPITER_BASE || '').replace(/\/$/, ''); // e.g. https://<worker>.workers.dev/jup
-const JUP_DIRECT = 'https://quote-api.jup.ag';
+const JUP_BASE = (process.env.JUPITER_BASE || '').replace(/\/$/, '');
 
-// Headers that look like a normal browser request (helps avoid 530/1016)
-const JUP_HEADERS = {
-  'Accept': 'application/json',
-  'User-Agent': 'Mozilla/5.0',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Origin': 'https://jup.ag',
-  'Referer': 'https://jup.ag/'
-};
-
-function buildUrl(base, path) {
-  const b = base.endsWith('/') ? base.slice(0, -1) : base;
-  return `${b}${path.startsWith('/') ? '' : '/'}${path}`;
-}
-
-async function fetchJsonTry(bases, path, init = {}) {
-  let lastErr;
-  for (const base of bases) {
-    if (!base) continue;
-    try {
-      const url = buildUrl(base, path);
-      const r = await fetch(url, {
-        // Merge our browser-y headers with any custom init.headers
-        headers: { ...JUP_HEADERS, ...(init.headers || {}) },
-        ...init
-      });
-      if (!r.ok) {
-        const text = await r.text().catch(() => '');
-        // On 5xx (includes 530), try the next base
-        if (r.status >= 500) { lastErr = new Error(`(${r.status}) ${text.slice(0,180)}`); continue; }
-        // 4xx etc: surface immediately (usually a real API error)
-        throw new Error(`(${r.status} ${r.statusText}) ${text.slice(0,180)}`);
-      }
-      // Parse JSON; if edge returns HTML, this will throw and we’ll try next base
-      return await r.json();
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw new Error(`Jupiter request failed on all bases: ${lastErr?.message || lastErr}`);
+function normalizeQuote(resp) {
+  if (resp?.data?.[0]) return resp.data[0]; // Jupiter v6 format
+  if (resp?.outAmount != null || resp?.inAmount != null) return resp; // Lite format
+  throw new Error('Quote response missing route');
 }
 
 async function jupQuote({ inputMint, outputMint, amountRaw, slippageBps }) {
-  const qs = new URLSearchParams();
-  qs.set('inputMint', inputMint);
-  qs.set('outputMint', outputMint);
-  qs.set('amount', String(amountRaw));
-  qs.set('slippageBps', String(slippageBps));
-  qs.set('onlyDirectRoutes', 'false');
+  const url = new URL(JUP_BASE + '/quote');
+  url.searchParams.set('inputMint', inputMint);
+  url.searchParams.set('outputMint', outputMint);
+  url.searchParams.set('amount', String(amountRaw));
+  url.searchParams.set('slippageBps', String(slippageBps));
+  url.searchParams.set('onlyDirectRoutes', 'false');
 
-  // Try DIRECT first (with hardened DNS), then Worker
-  const data = await fetchJsonTry([JUP_DIRECT, WORKER_JUP], `/v6/quote?${qs.toString()}`);
-  if (!data?.data?.[0]) throw new Error('No route');
-  return data.data[0];
+  const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`Quote failed (${r.status}) — ${text.slice(0,180)}`);
+
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error('Quote JSON parse failed'); }
+  return normalizeQuote(data);
 }
 
 async function jupBuildAndSend({ quoteResponse }) {
-  const body = JSON.stringify({
-    quoteResponse,
-    userPublicKey: keypair.publicKey.toBase58(),
-    wrapAndUnwrapSol: true,
-    dynamicComputeUnitLimit: true
+  const res = await fetch(JUP_BASE + '/swap', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      quoteResponse,
+      userPublicKey: keypair.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true
+    })
   });
 
-  // Try DIRECT first, then Worker
-  const data = await fetchJsonTry(
-    [JUP_DIRECT, WORKER_JUP],
-    '/v6/swap',
-    { method: 'POST', headers: { 'content-type': 'application/json' }, body }
-  );
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Swap build failed (${res.status}) — ${text.slice(0,180)}`);
+
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error('Swap JSON parse failed'); }
 
   const { swapTransaction } = data;
   if (!swapTransaction) throw new Error('No swapTransaction in response');
 
   const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'));
   tx.sign([keypair]);
-
   const sig = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 });
   const conf = await connection.confirmTransaction(sig, 'confirmed');
   if (conf.value.err) throw new Error(`Swap failed: ${JSON.stringify(conf.value.err)}`);
