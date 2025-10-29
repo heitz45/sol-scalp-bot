@@ -42,7 +42,13 @@ const {
   AUTOPILOT_MIN_5M_BUY_TX = '20',
   AUTOPILOT_MIN_5M_PRICE_CHANGE_PCT = '4',
   AUTOPILOT_COOLDOWN_MIN = '30',
-  AUTOPILOT_BLACKLIST = ''
+  AUTOPILOT_BLACKLIST = '',
+
+  // NEW: short-timeframe momentum & TP mode
+  AUTOPILOT_MIN_1M_PRICE_CHANGE_PCT = '2', // require ≥ +2% in last 1m
+  AUTOPILOT_MIN_1M_BUY_TX = '6',           // and at least 6 buys in last 1m
+  AUTOPILOT_MOMO_WEIGHT = '1.8',           // weight for 1m momentum in scoring
+  PARTIAL_TP_ENABLED = 'false'             // false = full exit on TP
 } = process.env;   // ←←← CLOSE the destructure and end with a semicolon
 // ^^^^^^^^^^^^^^^^ very important line
 
@@ -131,7 +137,12 @@ const AUTOPILOT_DEFAULTS = {
   cooldownMs: Number(AUTOPILOT_COOLDOWN_MIN) * 60 * 1000,
   blacklist: (AUTOPILOT_BLACKLIST || '').split(',').map(s => s.trim()).filter(Boolean),
   lastBuyAt: 0,
-  lastTried: {} // mint -> ts
+  lastTried: {}, // mint -> ts
+
+  // NEW defaults
+  minChange1m: Number(AUTOPILOT_MIN_1M_PRICE_CHANGE_PCT),
+  minBuys1m: Number(AUTOPILOT_MIN_1M_BUY_TX),
+  momoWeight: Number(AUTOPILOT_MOMO_WEIGHT)
 };
 function loadAutopilotCfg() {
   try {
@@ -465,6 +476,7 @@ Filters:
   minVol5m=${AUTOPILOT.minVol5m}
   minBuys5m=${AUTOPILOT.minBuys5m}
   minChange5m=${AUTOPILOT.minChange5m}%
+  minChg1m=${AUTOPILOT.minChange1m}%  minBuys1m=${AUTOPILOT.minBuys1m}
 Cooldown: ${(AUTOPILOT.cooldownMs/60000)|0} min (next in ~${minsLeft}m)
 Blacklist (${AUTOPILOT.blacklist.length}): ${AUTOPILOT.blacklist.slice(0,5).join(', ')}${AUTOPILOT.blacklist.length>5?'…':''}`
     );
@@ -486,6 +498,8 @@ minliq <USD>           (current: ${AUTOPILOT.minLiqUsd})
 minvol5m <USD>         (current: ${AUTOPILOT.minVol5m})
 minbuys5m <N>          (current: ${AUTOPILOT.minBuys5m})
 minchg5m <PCT>         (current: ${AUTOPILOT.minChange5m})
+minchg1m <PCT>         (current: ${AUTOPILOT.minChange1m})
+minbuys1m <N>          (current: ${AUTOPILOT.minBuys1m})
 cooldown <MINUTES>     (current: ${(AUTOPILOT.cooldownMs/60000)|0})
 blacklist add <MINT> | remove <MINT> | show`
     );
@@ -506,6 +520,8 @@ blacklist add <MINT> | remove <MINT> | show`
     if (cmd === 'minvol5m') { AUTOPILOT.minVol5m = numOrErr(val, 'minvol5m'); saveAutopilotCfg(); return ctx.reply(`✔️ minVol5m = ${AUTOPILOT.minVol5m}`); }
     if (cmd === 'minbuys5m') { AUTOPILOT.minBuys5m = Math.floor(numOrErr(val, 'minbuys5m')); saveAutopilotCfg(); return ctx.reply(`✔️ minBuys5m = ${AUTOPILOT.minBuys5m}`); }
     if (cmd === 'minchg5m') { AUTOPILOT.minChange5m = numOrErr(val, 'minchg5m'); saveAutopilotCfg(); return ctx.reply(`✔️ minChange5m = ${AUTOPILOT.minChange5m}%`); }
+    if (cmd === 'minchg1m') { AUTOPILOT.minChange1m = numOrErr(val, 'minchg1m'); saveAutopilotCfg(); return ctx.reply(`✔️ minChange1m = ${AUTOPILOT.minChange1m}%`); }
+    if (cmd === 'minbuys1m') { AUTOPILOT.minBuys1m = Math.floor(numOrErr(val, 'minbuys1m')); saveAutopilotCfg(); return ctx.reply(`✔️ minBuys1m = ${AUTOPILOT.minBuys1m}`); }
     if (cmd === 'cooldown') {
       const mins = numOrErr(val, 'cooldown');
       AUTOPILOT.cooldownMs = Math.max(0, Math.floor(mins * 60 * 1000));
@@ -607,6 +623,19 @@ async function monitorPositions() {
       }
 
       if (hitTP) {
+        // FULL EXIT on TP when partials disabled
+        if (String(PARTIAL_TP_ENABLED || 'false').toLowerCase() !== 'true') {
+          const { outLamports } = await sellTokensForSol({
+            mint, amountRaw: tokenBalRaw, slippageBps: THIN.SLIPPAGE_BASE
+          });
+          if (lastChatId) bot.telegram.sendMessage(
+            lastChatId,
+            `🏁 TP hit ${mint} at ~${pnlPct.toFixed(2)}%\nExited 100% — ~${(Number(outLamports)/1e9).toFixed(6)} SOL.`
+          );
+          delete positions[mint]; savePositions(); continue;
+        }
+
+        // (legacy behavior: partial TP then final)
         if (!p.tookPartialTP) {
           const toSell = tokenBalRaw / 2n;
           if (toSell > 0n) {
@@ -671,7 +700,6 @@ async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
   throw lastErr || new Error('All Dexscreener bases failed');
 }
 
-// ⬇️ INSERT THIS ENTIRE BLOCK RIGHT HERE
 // -------------------- DEXSCREENER: wide fan-out search & merge --------------------
 const DEX_MAX_RESULTS = Number(process.env.DEX_MAX_RESULTS || '200');
 
@@ -747,7 +775,6 @@ async function fetchDexScreenerSolanaPairs() {
 
 // -------------------- AUTOPILOT: select + loop --------------------
 function selectCandidates(pairs) {
-  // ... rest of your file continues ...
   const openCount = Object.keys(positions).length;
   const room = Math.max(0, AUTOPILOT.maxOpen - openCount);
   if (room === 0) return [];
@@ -759,6 +786,7 @@ function selectCandidates(pairs) {
   const drop = {
     notSolana: 0, noBase: 0, blacklisted: 0,
     liq: 0, vol5m: 0, buys5m: 0, chg5m: 0,
+    buys1m: 0, chg1m: 0, // NEW
     cooldown: 0, pass: 0
   };
 
@@ -771,15 +799,21 @@ function selectCandidates(pairs) {
         if (!baseMint) { drop.noBase++; return false; }
         if (ban.has(baseMint)) { drop.blacklisted++; return false; }
 
-        const liqUsd   = Number(p?.liquidity?.usd || 0);
-        const vol5m    = Number(p?.volume?.m5 || 0);
-        const buys5m   = Number(p?.txns?.m5?.buys || 0);
-        const change5m = Number(p?.priceChange?.m5 || 0);
+        const liqUsd    = Number(p?.liquidity?.usd || 0);
+        const vol5m     = Number(p?.volume?.m5 || 0);
+        const buys5m    = Number(p?.txns?.m5?.buys || 0);
+        const change5m  = Number(p?.priceChange?.m5 || 0);
+        const buys1m    = Number(p?.txns?.m1?.buys || 0);
+        const change1m  = Number(p?.priceChange?.m1 || 0);
 
         if (liqUsd   < AUTOPILOT.minLiqUsd)      { drop.liq++; return false; }
         if (vol5m    < AUTOPILOT.minVol5m)       { drop.vol5m++; return false; }
         if (buys5m   < AUTOPILOT.minBuys5m)      { drop.buys5m++; return false; }
         if (change5m < AUTOPILOT.minChange5m)    { drop.chg5m++; return false; }
+
+        // NEW: 1m momentum gates
+        if (buys1m   < AUTOPILOT.minBuys1m)      { drop.buys1m++; return false; }
+        if (change1m < AUTOPILOT.minChange1m)    { drop.chg1m++;  return false; }
 
         const baseLast = AUTOPILOT.lastTried[baseMint] || 0;
         if (now - baseLast < AUTOPILOT.cooldownMs) { drop.cooldown++; return false; }
@@ -792,10 +826,14 @@ function selectCandidates(pairs) {
     })
     .map(p => {
       const baseMint = p.baseToken.address;
+      const w = AUTOPILOT.momoWeight || 1.8;
       const score =
         (Number(p.txns?.m5?.buys || 0) * 2) +
         (Number(p.volume?.m5 || 0) / 500) +
-        (Number(p.priceChange?.m5 || 0));
+        (Number(p.priceChange?.m5 || 0)) +
+        // NEW: short-term “burst” bonus
+        (Number(p.txns?.m1?.buys || 0) * 1.2 * w) +
+        (Number(p.priceChange?.m1 || 0) * 1.5 * w);
       return { baseMint, score };
     })
     .sort((a, b) => b.score - a.score);
@@ -803,6 +841,7 @@ function selectCandidates(pairs) {
   console.log('[AUTO] drop stats', {
     notSolana: drop.notSolana, noBase: drop.noBase, blacklisted: drop.blacklisted,
     liq: drop.liq, vol5m: drop.vol5m, buys5m: drop.buys5m, chg5m: drop.chg5m,
+    buys1m: drop.buys1m, chg1m: drop.chg1m, // NEW
     perMintCooldown: drop.cooldown, pass: drop.pass
   });
 
@@ -829,6 +868,8 @@ async function autopilotLoop() {
       minVol5m: AUTOPILOT.minVol5m,
       minBuys5m: AUTOPILOT.minBuys5m,
       minChange5m: AUTOPILOT.minChange5m,
+      minChange1m: AUTOPILOT.minChange1m,
+      minBuys1m: AUTOPILOT.minBuys1m,
       maxOpen: AUTOPILOT.maxOpen,
       open: Object.keys(positions).length,
       budgetSol: AUTOPILOT.budgetSol
