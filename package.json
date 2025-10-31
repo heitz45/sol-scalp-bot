@@ -1,17 +1,20 @@
 {
-  "name": "solana-autopilot-bot",
+  "name": "sol-pump-bot",
   "version": "1.0.0",
-  "description": "Autonomous Solana trading bot with Telegram integration",
-  "main": "bot.js",
   "type": "module",
+  "private": true,
+  "engines": { "node": ">=18.17" },
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "dev": "NODE_ENV=development node bot.js",
+    "lint": "echo \"(optional)\""
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.0",
-    "bs58": "^5.0.0",
-    "dotenv": "^16.0.3",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.5",
     "node-fetch": "^3.3.2",
-    "telegraf": "^4.15.0"
+    "telegraf": "^4.16.3",
+    "ws": "^8.18.0"
   }
 }
