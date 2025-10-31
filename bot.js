@@ -1,13 +1,14 @@
-// bot.js — Fully-automated thin-liquidity SCALP bot for Solana
-// Features: Auth, whoami/authstatus, sharded buys/sells, TP/SL monitor,
-// Autopilot (Dexscreener) with Telegram toggle & filter editing,
-// Dexscreener fetch via search endpoint (chain:solana) with retries/fallbacks,
-// Debug commands: /scan (force scan), /autosim (routing sanity).
+// bot.js — Pump.fun-enabled thin-liquidity SCALP bot for Solana
+// Features: Auth, whoami/authstatus, sharded TP/SL monitor,
+// Autopilot (PumpPortal websocket signals), micro TF (15s/30s/1m/5m),
+// Trades via PumpPortal bonding curve with Jupiter fallback after migration.
+// Requires: npm i ws node-fetch telegraf bs58 @solana/web3.js dotenv
 
 import 'dotenv/config';
 import fs from 'fs';
 import fetch from 'node-fetch';
 import bs58 from 'bs58';
+import WebSocket from 'ws';
 import { Telegraf } from 'telegraf';
 import {
   Connection,
@@ -20,7 +21,7 @@ import dns from 'node:dns';
 dns.setDefaultResultOrder('ipv4first');
 dns.setServers(['1.1.1.1', '8.8.8.8']); // Cloudflare + Google DNS
 
-// at the very top of bot.js (after imports)
+// -------------------- ENV --------------------
 const {
   RPC_URL = 'https://api.mainnet-beta.solana.com',
   WALLET_PRIVATE_KEY_BASE58,
@@ -33,25 +34,41 @@ const {
   DEFAULT_BUY_SOL = '0.05',
   POLL_SECONDS = '10',
 
-  // Initial AUTOPILOT defaults (persisted to autopilot.json on first run)
+  // Autopilot defaults (persisted to autopilot.json on first run)
   AUTOPILOT_ENABLED = 'false',
   AUTOPILOT_BUDGET_SOL_PER_BUY = '0.02',
   AUTOPILOT_MAX_OPEN_POSITIONS = '3',
-  AUTOPILOT_MIN_LIQ_USD = '6000',
-  AUTOPILOT_MIN_5M_VOLUME_USD = '1500',
+  // Dex liquidity/volume filters don't exist pre-migration; we use momentum gates instead.
   AUTOPILOT_MIN_5M_BUY_TX = '20',
   AUTOPILOT_MIN_5M_PRICE_CHANGE_PCT = '4',
   AUTOPILOT_COOLDOWN_MIN = '30',
   AUTOPILOT_BLACKLIST = '',
 
-  // NEW: short-timeframe momentum & TP mode
-  AUTOPILOT_MIN_1M_PRICE_CHANGE_PCT = '2', // require ≥ +2% in last 1m
-  AUTOPILOT_MIN_1M_BUY_TX = '6',           // and at least 6 buys in last 1m
-  AUTOPILOT_MOMO_WEIGHT = '1.8',           // weight for 1m momentum in scoring
-  PARTIAL_TP_ENABLED = 'false'             // false = full exit on TP
-} = process.env;   // ←←← CLOSE the destructure and end with a semicolon
-// ^^^^^^^^^^^^^^^^ very important line
+  // Short-timeframe momentum
+  AUTOPILOT_MIN_1M_PRICE_CHANGE_PCT = '2',
+  AUTOPILOT_MIN_1M_BUY_TX = '6',
+  AUTOPILOT_MOMO_WEIGHT = '1.8',
 
+  // NEW: sub-minute gates
+  AUTOPILOT_MIN_30S_PRICE_CHANGE_PCT = '0.9',
+  AUTOPILOT_MIN_30S_BUY_TX = '4',
+  AUTOPILOT_MIN_15S_PRICE_CHANGE_PCT = '0.6',
+  AUTOPILOT_MIN_15S_BUY_TX = '3',
+
+  PARTIAL_TP_ENABLED = 'false',
+
+  // Jupiter proxy (unchanged)
+  JUPITER_BASE = 'https://quote-api.jup.ag/v6',
+
+  // PumpPortal realtime + trade
+  PUMPPORTAL_WSS = 'wss://pumpportal.fun/api/data',
+  PUMPPORTAL_API_KEY = '',
+  USE_PUMPPORTAL_TRADE = 'true',
+  PUMPPORTAL_DEFAULT_SLIPPAGE = '10',     // percent
+  PUMPPORTAL_PRIORITY_FEE = '0.00005'     // SOL
+} = process.env;
+
+// -------------------- GUARDS --------------------
 if (!WALLET_PRIVATE_KEY_BASE58) { console.error('Missing WALLET_PRIVATE_KEY_BASE58'); process.exit(1); }
 if (!TELEGRAM_BOT_TOKEN) { console.error('Missing TELEGRAM_BOT_TOKEN'); process.exit(1); }
 
@@ -130,8 +147,7 @@ const AUTOPILOT_DEFAULTS = {
   enabled: String(AUTOPILOT_ENABLED).toLowerCase() === 'true',
   budgetSol: Number(AUTOPILOT_BUDGET_SOL_PER_BUY),
   maxOpen: Number(AUTOPILOT_MAX_OPEN_POSITIONS),
-  minLiqUsd: Number(AUTOPILOT_MIN_LIQ_USD),
-  minVol5m: Number(AUTOPILOT_MIN_5M_VOLUME_USD),
+  // Momentum gates only (pre-migration)
   minBuys5m: Number(AUTOPILOT_MIN_5M_BUY_TX),
   minChange5m: Number(AUTOPILOT_MIN_5M_PRICE_CHANGE_PCT),
   cooldownMs: Number(AUTOPILOT_COOLDOWN_MIN) * 60 * 1000,
@@ -139,10 +155,16 @@ const AUTOPILOT_DEFAULTS = {
   lastBuyAt: 0,
   lastTried: {}, // mint -> ts
 
-  // NEW defaults
+  // Short-term gates
   minChange1m: Number(AUTOPILOT_MIN_1M_PRICE_CHANGE_PCT),
   minBuys1m: Number(AUTOPILOT_MIN_1M_BUY_TX),
-  momoWeight: Number(AUTOPILOT_MOMO_WEIGHT)
+  momoWeight: Number(AUTOPILOT_MOMO_WEIGHT),
+
+  // Sub-minute gates
+  minChange30s: Number(AUTOPILOT_MIN_30S_PRICE_CHANGE_PCT),
+  minBuys30s: Number(AUTOPILOT_MIN_30S_BUY_TX),
+  minChange15s: Number(AUTOPILOT_MIN_15S_PRICE_CHANGE_PCT),
+  minBuys15s: Number(AUTOPILOT_MIN_15S_BUY_TX)
 };
 function loadAutopilotCfg() {
   try {
@@ -155,7 +177,7 @@ function saveAutopilotCfg() { fs.writeFileSync(AUTOPILOT_CFG_FILE, JSON.stringif
 const AUTOPILOT = loadAutopilotCfg();
 
 // -------------------- JUPITER HELPERS --------------------
-const JUP_BASE = (process.env.JUPITER_BASE || '').replace(/\/$/, '');
+const JUP_BASE = (JUPITER_BASE || '').replace(/\/$/, '');
 
 function normalizeQuote(resp) {
   if (resp?.data?.[0]) return resp.data[0]; // Jupiter v6 format
@@ -209,11 +231,6 @@ async function jupBuildAndSend({ quoteResponse }) {
   return sig;
 }
 
-function extractImpactPct(route) {
-  if (route?.priceImpactPct != null) return Number(route.priceImpactPct);
-  return NaN;
-}
-
 // -------------------- CHAIN HELPERS --------------------
 async function verifyMintExists(mint) {
   const pk = new PublicKey(mint);
@@ -242,65 +259,150 @@ async function estimateSolForToken({ mint, amountRaw }) {
   return BigInt(route.outAmount);
 }
 
-// -------------------- THIN-LIQ BUY & SELL --------------------
-async function buyBySol({ mint, amountSol, slippageBps }) {
-  let remainingSol = Number(amountSol);
-  let spentLamports = 0n;
-  let receivedRaw = 0n;
-  let shards = 0;
-  let curSlip = Math.min(Number(slippageBps || THIN.SLIPPAGE_BASE), THIN.SLIPPAGE_CAP);
+// -------------------- PUMPPORTAL REALTIME SIGNAL ENGINE --------------------
+const PUMP_WSS = PUMPPORTAL_WSS || 'wss://pumpportal.fun/api/data';
+const feed = {
+  // mint -> { lastPriceSol, trades: [{ts, side, priceSol, amountSol}] }
+  byMint: new Map(),
+  metrics(mint) {
+    const now = Date.now();
+    const b = this.byMint.get(mint);
+    if (!b) return null;
+    // Keep last 5 minutes
+    b.trades = b.trades.filter(t => now - t.ts <= 5*60*1000);
 
-  while (remainingSol > 0 && shards < THIN.MAX_SHARDS) {
-    const proposedSol = Math.max(
-      Math.min(remainingSol, Number((amountSol / THIN.MAX_SHARDS).toFixed(6))),
-      THIN.MIN_SHARD_SOL
-    );
-    const lamports = Math.floor(proposedSol * 1e9);
+    const within = (ms) => b.trades.filter(t => now - t.ts <= ms);
 
-    const route = await jupQuote({ inputMint: WSOL_MINT, outputMint: mint, amountRaw: lamports, slippageBps: curSlip });
-    const impact = extractImpactPct(route);
+    const m15 = within(15*1000);
+    const m30 = within(30*1000);
+    const m60 = within(60*1000);
+    const m300= within(5*60*1000);
 
-    if (!Number.isNaN(impact) && impact > THIN.HARD_IMPACT) {
-      if (proposedSol <= THIN.MIN_SHARD_SOL + 1e-9) throw new Error(`Price impact too high (${impact.toFixed(2)}%).`);
-      remainingSol = Math.max(remainingSol - proposedSol / 2, 0);
-      continue;
+    const priceNow = b.lastPriceSol ?? (m60[m60.length-1]?.priceSol ?? null);
+
+    function pctChange(arr) {
+      if (arr.length < 2) return 0;
+      const first = arr[0].priceSol;
+      const last  = arr[arr.length-1].priceSol;
+      if (!first || !last) return 0;
+      return ((last - first)/first)*100;
     }
 
-    if (!Number.isNaN(impact) && impact > THIN.TARGET_IMPACT && proposedSol > THIN.MIN_SHARD_SOL) {
-      const smallerSol = Math.max(proposedSol / 2, THIN.MIN_SHARD_SOL);
-      const smallerLamports = Math.floor(smallerSol * 1e9);
-      const smallerRoute = await jupQuote({ inputMint: WSOL_MINT, outputMint: mint, amountRaw: smallerLamports, slippageBps: curSlip });
-      const smallerImpact = extractImpactPct(smallerRoute);
+    const buys = a => a.filter(t => t.side === 'buy').length;
 
-      if (!Number.isNaN(smallerImpact) && smallerImpact <= impact) {
-        await jupBuildAndSend({ quoteResponse: smallerRoute });
-        spentLamports += BigInt(smallerRoute.inAmount || smallerLamports);
-        receivedRaw   += BigInt(smallerRoute.outAmount);
-        remainingSol  -= smallerSol;
-        shards++;
-        await new Promise(r => setTimeout(r, THIN.SHARD_DELAY_MS));
-        continue;
+    return {
+      priceNowSol: priceNow,
+
+      // Sub-minute
+      buys15s: buys(m15), chg15s: pctChange(m15),
+      buys30s: buys(m30), chg30s: pctChange(m30),
+
+      // Minute & 5m
+      buys1m: buys(m60), chg1m: pctChange(m60),
+      buys5m: buys(m300), chg5m: pctChange(m300)
+    };
+  }
+};
+
+function attachPumpPortal() {
+  const ws = new WebSocket(PUMP_WSS);
+
+  ws.on('open', () => {
+    // Stream new token events; we will subscribe to trades for each new mint.
+    ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+  });
+
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+
+      // New token created
+      if (msg.message === 'newToken' && msg.mint) {
+        ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [msg.mint] }));
+        if (!feed.byMint.has(msg.mint)) feed.byMint.set(msg.mint, { lastPriceSol: null, trades: [] });
       }
-    }
 
-    await jupBuildAndSend({ quoteResponse: route });
-    spentLamports += BigInt(route.inAmount || lamports);
-    receivedRaw   += BigInt(route.outAmount);
-    remainingSol  -= proposedSol;
-    shards++;
-    await new Promise(r => setTimeout(r, THIN.SHARD_DELAY_MS));
+      // Per-token trade stream
+      if (msg.message === 'tokenTrade' && msg.mint) {
+        const m = feed.byMint.get(msg.mint) || { lastPriceSol: null, trades: [] };
+        const side = String(msg.side || '').toLowerCase();
+        const priceSol = Number(msg.priceSol ?? msg.price ?? 0);
+        const amountSol = Number(msg.solAmount ?? msg.amountSol ?? 0);
+
+        if (priceSol > 0) m.lastPriceSol = priceSol;
+        m.trades.push({ ts: Date.now(), side, priceSol, amountSol });
+        feed.byMint.set(msg.mint, m);
+      }
+    } catch {}
+  });
+
+  ws.on('close', () => setTimeout(attachPumpPortal, 1500));
+  ws.on('error', () => ws.close());
+}
+attachPumpPortal();
+
+// -------------------- TRADING HELPERS: PumpPortal + Jupiter fallback --------------------
+async function pumpportalTrade({ action, mint, amountSol, amountRawTokens }) {
+  const apiKey = PUMPPORTAL_API_KEY || '';
+  if (!apiKey) throw new Error('Missing PUMPPORTAL_API_KEY');
+
+  const body = {
+    action,                                 // 'buy' | 'sell'
+    mint,
+    slippage: Number(PUMPPORTAL_DEFAULT_SLIPPAGE || 10),
+    priorityFee: Number(PUMPPORTAL_PRIORITY_FEE || 0.00005),
+    pool: 'auto'
+  };
+  if (action === 'buy') {
+    body.denominatedInSol = 'true';
+    body.amount = Number(amountSol);
+  } else {
+    body.denominatedInSol = 'false';
+    body.amount = typeof amountRawTokens === 'string' ? amountRawTokens : Number(amountRawTokens || 0);
   }
 
-  if (receivedRaw <= 0n) throw new Error('Buy produced zero output.');
-  return {
-    sig: '(multiple shards)',
-    outAmountRaw: receivedRaw,
-    totalSpentLamports: spentLamports,
-    shardsExecuted: shards
-  };
+  const r = await fetch(`https://pumpportal.fun/api/trade?api-key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`PumpPortal trade failed ${r.status}: ${text.slice(0,180)}`);
+  return JSON.parse(text); // contains signature/status
 }
 
-async function sellTokensForSol({ mint, amountRaw, slippageBps }) {
+async function smartBuy({ mint, amountSol }) {
+  const usePP = String(USE_PUMPPORTAL_TRADE || 'true').toLowerCase() === 'true';
+  if (usePP) {
+    try {
+      await pumpportalTrade({ action: 'buy', mint, amountSol });
+      return { route: 'pumpportal', outRaw: 0n, spentSol: Number(amountSol) };
+    } catch (e) {
+      console.warn('[PP buy fallback to JUP]', e.message);
+    }
+  }
+  const lamports = Math.floor(Number(amountSol) * 1e9);
+  const routeQuote = await jupQuote({
+    inputMint: WSOL_MINT,
+    outputMint: mint,
+    amountRaw: lamports,
+    slippageBps: THIN.SLIPPAGE_BASE
+  });
+  await jupBuildAndSend({ quoteResponse: routeQuote });
+  return { route: 'jupiter', outRaw: BigInt(routeQuote.outAmount || 0), spentSol: Number(lamports)/1e9 };
+}
+
+async function smartSell({ mint, amountRaw }) {
+  const usePP = String(USE_PUMPPORTAL_TRADE || 'true').toLowerCase() === 'true';
+  if (usePP) {
+    try {
+      await pumpportalTrade({ action: 'sell', mint, amountRawTokens: String(amountRaw) });
+      return { route: 'pumpportal', outLamports: 0n };
+    } catch (e) {
+      console.warn('[PP sell fallback to JUP]', e.message);
+    }
+  }
+  // fallback to Jupiter shard-sell
   const totalRaw = BigInt(amountRaw);
   if (totalRaw <= 0n) throw new Error('Nothing to sell');
 
@@ -317,7 +419,7 @@ async function sellTokensForSol({ mint, amountRaw, slippageBps }) {
       inputMint: mint,
       outputMint: WSOL_MINT,
       amountRaw: String(slice),
-      slippageBps: Math.min(Number(slippageBps || THIN.SLIPPAGE_BASE), THIN.SLIPPAGE_CAP)
+      slippageBps: Math.min(Number(THIN.SLIPPAGE_BASE), THIN.SLIPPAGE_CAP)
     });
 
     await jupBuildAndSend({ quoteResponse: route });
@@ -327,7 +429,13 @@ async function sellTokensForSol({ mint, amountRaw, slippageBps }) {
     await new Promise(r => setTimeout(r, THIN.EXIT_DELAY_MS));
   }
 
-  return { sig: '(multiple shards)', outLamports: soldLamports };
+  return { route: 'jupiter', outLamports: soldLamports };
+}
+
+// -------------------- BUY via JUP (legacy shards) — used by /autosim only --------------------
+function extractImpactPct(route) {
+  if (route?.priceImpactPct != null) return Number(route.priceImpactPct);
+  return NaN;
 }
 
 // -------------------- TELEGRAM COMMANDS --------------------
@@ -395,10 +503,8 @@ bot.command('buy', authGuard(async (ctx) => {
   if (isNaN(sol) || sol <= 0) return ctx.reply('Invalid SOL amount.');
   try {
     await verifyMintExists(mint);
-    const { outAmountRaw, totalSpentLamports, shardsExecuted } = await buyBySol({
-      mint, amountSol: sol, slippageBps: THIN.SLIPPAGE_BASE
-    });
-    ctx.reply(`Bought ${(Number(totalSpentLamports)/1e9).toFixed(6)} SOL of ${mint}\nReceived (raw): ${outAmountRaw}\nShards: ${shardsExecuted}`);
+    const res = await smartBuy({ mint, amountSol: sol });
+    ctx.reply(`Bought ~${res.spentSol.toFixed(6)} SOL of ${mint}\nRoute: ${res.route}`);
   } catch (e) { ctx.reply(`Buy failed: ${e.message}`); }
 }));
 
@@ -410,8 +516,12 @@ bot.command('sell', authGuard(async (ctx) => {
     const raw = await getTokenRawBalance(mint);
     if (raw <= 0n) throw new Error('No balance');
     const toSell = (raw * BigInt(Math.floor(pct))) / 100n;
-    const { outLamports } = await sellTokensForSol({ mint, amountRaw: toSell, slippageBps: THIN.SLIPPAGE_BASE });
-    ctx.reply(`Sold ${pct}% — received ~${(Number(outLamports)/1e9).toFixed(6)} SOL`);
+    const res = await smartSell({ mint, amountRaw: toSell });
+    if (res.route === 'jupiter') {
+      ctx.reply(`Sold ${pct}% — received ~${(Number(res.outLamports||0n)/1e9).toFixed(6)} SOL (route: jupiter)`);
+    } else {
+      ctx.reply(`Sold ${pct}% via pumpportal (bonding curve).`);
+    }
   } catch (e) { ctx.reply(`Sell failed: ${e.message}`); }
 }));
 
@@ -424,13 +534,11 @@ bot.command('autobuy', authGuard(async (ctx) => {
   if (isNaN(sol) || sol <= 0) return ctx.reply('Invalid SOL amount.');
   try {
     await verifyMintExists(mint);
-    const { outAmountRaw, totalSpentLamports, shardsExecuted } = await buyBySol({
-      mint, amountSol: sol, slippageBps: THIN.SLIPPAGE_BASE
-    });
+    const res = await smartBuy({ mint, amountSol: sol });
     positions[mint] = {
       mint,
-      entrySolSpent: Number(totalSpentLamports)/1e9,
-      entryTokenRecvRaw: outAmountRaw.toString(),
+      entrySolSpent: res.spentSol,
+      entryTokenRecvRaw: (res.outRaw || 0n).toString(),
       tpPct: SCALP_TP_PCT,
       slPct: SCALP_SL_PCT,
       createdAt: new Date().toISOString(),
@@ -439,7 +547,7 @@ bot.command('autobuy', authGuard(async (ctx) => {
       tookPartialTP: false
     };
     savePositions();
-    ctx.reply(`Auto-buy ✅ ${mint}\nSpent: ${(Number(totalSpentLamports)/1e9).toFixed(6)} SOL\nShards: ${shardsExecuted}\nTP: +${SCALP_TP_PCT}% | SL: -${SCALP_SL_PCT}%`);
+    ctx.reply(`Auto-buy ✅ ${mint}\nSpent: ${res.spentSol.toFixed(6)} SOL\nRoute: ${res.route}\nTP: +${SCALP_TP_PCT}% | SL: -${SCALP_SL_PCT}%`);
   } catch (e) { ctx.reply(`Autobuy failed: ${e.message}`); }
 }));
 
@@ -461,7 +569,6 @@ bot.command('cancel', authGuard((ctx) => {
   ctx.reply(`Canceled monitoring for ${mint}.`);
 }));
 
-// -------------------- AUTOPILOT COMMANDS --------------------
 bot.command('autopilot', authGuard(async (ctx) => {
   const [, sub] = ctx.message.text.trim().split(/\s+/);
 
@@ -471,19 +578,17 @@ bot.command('autopilot', authGuard(async (ctx) => {
 `🤖 Autopilot: ${AUTOPILOT.enabled ? 'ON' : 'OFF'}
 Budget/Buy: ${AUTOPILOT.budgetSol} SOL
 Max Open: ${AUTOPILOT.maxOpen}
-Filters:
-  minLiqUsd=${AUTOPILOT.minLiqUsd}
-  minVol5m=${AUTOPILOT.minVol5m}
-  minBuys5m=${AUTOPILOT.minBuys5m}
-  minChange5m=${AUTOPILOT.minChange5m}%
-  minChg1m=${AUTOPILOT.minChange1m}%  minBuys1m=${AUTOPILOT.minBuys1m}
+Momentum gates:
+  15s:  buys≥${AUTOPILOT.minBuys15s}  chg≥${AUTOPILOT.minChange15s}%
+  30s:  buys≥${AUTOPILOT.minBuys30s}  chg≥${AUTOPILOT.minChange30s}%
+   1m:  buys≥${AUTOPILOT.minBuys1m}   chg≥${AUTOPILOT.minChange1m}%
+   5m:  buys≥${AUTOPILOT.minBuys5m}   chg≥${AUTOPILOT.minChange5m}%
 Cooldown: ${(AUTOPILOT.cooldownMs/60000)|0} min (next in ~${minsLeft}m)
 Blacklist (${AUTOPILOT.blacklist.length}): ${AUTOPILOT.blacklist.slice(0,5).join(', ')}${AUTOPILOT.blacklist.length>5?'…':''}`
     );
   }
   if (sub === 'on') { AUTOPILOT.enabled = true; saveAutopilotCfg(); return ctx.reply('✅ Autopilot ON'); }
   if (sub === 'off') { AUTOPILOT.enabled = false; saveAutopilotCfg(); return ctx.reply('⏸️ Autopilot OFF'); }
-
   return ctx.reply('Usage: /autopilot on | off | status');
 }));
 
@@ -494,12 +599,14 @@ bot.command('autofilters', authGuard((ctx) => {
 `Autopilot Filters:
 budget <SOL>           (current: ${AUTOPILOT.budgetSol})
 maxopen <N>            (current: ${AUTOPILOT.maxOpen})
-minliq <USD>           (current: ${AUTOPILOT.minLiqUsd})
-minvol5m <USD>         (current: ${AUTOPILOT.minVol5m})
+minbuys15s <N>         (current: ${AUTOPILOT.minBuys15s})
+minchg15s <PCT>        (current: ${AUTOPILOT.minChange15s})
+minbuys30s <N>         (current: ${AUTOPILOT.minBuys30s})
+minchg30s <PCT>        (current: ${AUTOPILOT.minChange30s})
+minbuys1m <N>          (current: ${AUTOPILOT.minBuys1m})
+minchg1m <PCT>         (current: ${AUTOPILOT.minChange1m})
 minbuys5m <N>          (current: ${AUTOPILOT.minBuys5m})
 minchg5m <PCT>         (current: ${AUTOPILOT.minChange5m})
-minchg1m <PCT>         (current: ${AUTOPILOT.minChange1m})
-minbuys1m <N>          (current: ${AUTOPILOT.minBuys1m})
 cooldown <MINUTES>     (current: ${(AUTOPILOT.cooldownMs/60000)|0})
 blacklist add <MINT> | remove <MINT> | show`
     );
@@ -516,17 +623,23 @@ blacklist add <MINT> | remove <MINT> | show`
   try {
     if (cmd === 'budget') { AUTOPILOT.budgetSol = numOrErr(val, 'budget'); saveAutopilotCfg(); return ctx.reply(`✔️ budgetSol = ${AUTOPILOT.budgetSol} SOL`); }
     if (cmd === 'maxopen') { AUTOPILOT.maxOpen = Math.max(0, Math.floor(numOrErr(val, 'maxopen'))); saveAutopilotCfg(); return ctx.reply(`✔️ maxOpen = ${AUTOPILOT.maxOpen}`); }
-    if (cmd === 'minliq') { AUTOPILOT.minLiqUsd = numOrErr(val, 'minliq'); saveAutopilotCfg(); return ctx.reply(`✔️ minLiqUsd = ${AUTOPILOT.minLiqUsd}`); }
-    if (cmd === 'minvol5m') { AUTOPILOT.minVol5m = numOrErr(val, 'minvol5m'); saveAutopilotCfg(); return ctx.reply(`✔️ minVol5m = ${AUTOPILOT.minVol5m}`); }
-    if (cmd === 'minbuys5m') { AUTOPILOT.minBuys5m = Math.floor(numOrErr(val, 'minbuys5m')); saveAutopilotCfg(); return ctx.reply(`✔️ minBuys5m = ${AUTOPILOT.minBuys5m}`); }
-    if (cmd === 'minchg5m') { AUTOPILOT.minChange5m = numOrErr(val, 'minchg5m'); saveAutopilotCfg(); return ctx.reply(`✔️ minChange5m = ${AUTOPILOT.minChange5m}%`); }
-    if (cmd === 'minchg1m') { AUTOPILOT.minChange1m = numOrErr(val, 'minchg1m'); saveAutopilotCfg(); return ctx.reply(`✔️ minChange1m = ${AUTOPILOT.minChange1m}%`); }
-    if (cmd === 'minbuys1m') { AUTOPILOT.minBuys1m = Math.floor(numOrErr(val, 'minbuys1m')); saveAutopilotCfg(); return ctx.reply(`✔️ minBuys1m = ${AUTOPILOT.minBuys1m}`); }
+
+    // Sub-minute & minute gates
+    if (cmd === 'minbuys15s') { AUTOPILOT.minBuys15s = Math.floor(numOrErr(val, 'minbuys15s')); saveAutopilotCfg(); return ctx.reply(`✔️ minBuys15s = ${AUTOPILOT.minBuys15s}`); }
+    if (cmd === 'minchg15s')  { AUTOPILOT.minChange15s = numOrErr(val, 'minchg15s'); saveAutopilotCfg(); return ctx.reply(`✔️ minChange15s = ${AUTOPILOT.minChange15s}%`); }
+    if (cmd === 'minbuys30s') { AUTOPILOT.minBuys30s = Math.floor(numOrErr(val, 'minbuys30s')); saveAutopilotCfg(); return ctx.reply(`✔️ minBuys30s = ${AUTOPILOT.minBuys30s}`); }
+    if (cmd === 'minchg30s')  { AUTOPILOT.minChange30s = numOrErr(val, 'minchg30s'); saveAutopilotCfg(); return ctx.reply(`✔️ minChange30s = ${AUTOPILOT.minChange30s}%`); }
+    if (cmd === 'minbuys1m')  { AUTOPILOT.minBuys1m  = Math.floor(numOrErr(val, 'minbuys1m'));  saveAutopilotCfg(); return ctx.reply(`✔️ minBuys1m = ${AUTOPILOT.minBuys1m}`); }
+    if (cmd === 'minchg1m')   { AUTOPILOT.minChange1m = numOrErr(val, 'minchg1m'); saveAutopilotCfg(); return ctx.reply(`✔️ minChange1m = ${AUTOPILOT.minChange1m}%`); }
+    if (cmd === 'minbuys5m')  { AUTOPILOT.minBuys5m  = Math.floor(numOrErr(val, 'minbuys5m'));  saveAutopilotCfg(); return ctx.reply(`✔️ minBuys5m = ${AUTOPILOT.minBuys5m}`); }
+    if (cmd === 'minchg5m')   { AUTOPILOT.minChange5m = numOrErr(val, 'minchg5m'); saveAutopilotCfg(); return ctx.reply(`✔️ minChange5m = ${AUTOPILOT.minChange5m}%`); }
+
     if (cmd === 'cooldown') {
       const mins = numOrErr(val, 'cooldown');
       AUTOPILOT.cooldownMs = Math.max(0, Math.floor(mins * 60 * 1000));
       saveAutopilotCfg(); return ctx.reply(`✔️ cooldown = ${(AUTOPILOT.cooldownMs/60000)|0} min`);
     }
+
     if (cmd === 'blacklist') {
       const sub = (parts[2] || '').toLowerCase();
       const mint = parts[3];
@@ -546,24 +659,22 @@ blacklist add <MINT> | remove <MINT> | show`
       }
       return ctx.reply('Usage: /autofilters blacklist show|add <MINT>|remove <MINT>');
     }
+
     return ctx.reply('Unknown subcommand. Send /autofilters to see options.');
   } catch (e) { return ctx.reply(`⚠️ ${e.message}`); }
 }));
 
-// -------------------- DEBUG COMMANDS --------------------
-// Force a scan now (does not buy; shows how many candidates)
+// -------------------- DEBUG: /scan uses Pump signals --------------------
 bot.command('scan', authGuard(async (ctx) => {
-  try {
-    const pairs = await fetchDexScreenerSolanaPairs();
-    ctx.reply(`[SCAN] fetched ${pairs.length} pairs. Filtering...`);
-    const cands = selectCandidates(pairs);
-    ctx.reply(`[SCAN] candidates=${cands.length}${cands.length? '\nTop: ' + cands.slice(0,5).join('\n') : ''}`);
-  } catch (e) {
-    ctx.reply(`[SCAN] error: ${e.message}`);
-  }
+  const cands = selectCandidatesFromPump();
+  const top = cands.slice(0, 5).map(m => {
+    const x = feed.metrics(m);
+    return `${m} | 15s:+${x.chg15s.toFixed(1)}%(${x.buys15s}) 30s:+${x.chg30s.toFixed(1)}%(${x.buys30s}) 1m:+${x.chg1m.toFixed(1)}%(${x.buys1m}) 5m:+${x.chg5m.toFixed(1)}%(${x.buys5m})`;
+  });
+  ctx.reply(`[SCAN] candidates=${cands.length}${top.length ? '\nTop:\n' + top.join('\n') : ''}`);
 }));
 
-// Try a tiny test route for a mint
+// Try a tiny test route for a mint (Jupiter sanity)
 bot.command('autosim', authGuard(async (ctx) => {
   const [, mint, solStr] = ctx.message.text.trim().split(/\s+/);
   const testSol = Number(solStr || AUTOPILOT.budgetSol || 0.01);
@@ -594,7 +705,7 @@ bot.command('autosim', authGuard(async (ctx) => {
   }
 }));
 
-// -------------------- MONITOR LOOP: TP/SL --------------------
+// -------------------- MONITOR LOOP: TP/SL (uses Jupiter mark for P&L) --------------------
 async function monitorPositions() {
   const now = new Date().toISOString();
   for (const mint of Object.keys(positions)) {
@@ -617,36 +728,34 @@ async function monitorPositions() {
       if (!hitTP && !hitSL) continue;
 
       if (hitSL) {
-        const { outLamports } = await sellTokensForSol({ mint, amountRaw: tokenBalRaw, slippageBps: THIN.SLIPPAGE_BASE });
-        if (lastChatId) bot.telegram.sendMessage(lastChatId, `🔻 SL hit ${mint} at ~${pnlPct.toFixed(2)}%\nExited ~${(Number(outLamports)/1e9).toFixed(6)} SOL.`);
+        const res = await smartSell({ mint, amountRaw: tokenBalRaw });
+        if (lastChatId) bot.telegram.sendMessage(lastChatId, `🔻 SL hit ${mint} at ~${pnlPct.toFixed(2)}%\nExited${res.route==='jupiter'?` ~${(Number(res.outLamports||0n)/1e9).toFixed(6)} SOL`:''}.`);
         delete positions[mint]; savePositions(); continue;
       }
 
       if (hitTP) {
         // FULL EXIT on TP when partials disabled
         if (String(PARTIAL_TP_ENABLED || 'false').toLowerCase() !== 'true') {
-          const { outLamports } = await sellTokensForSol({
-            mint, amountRaw: tokenBalRaw, slippageBps: THIN.SLIPPAGE_BASE
-          });
+          const res = await smartSell({ mint, amountRaw: tokenBalRaw });
           if (lastChatId) bot.telegram.sendMessage(
             lastChatId,
-            `🏁 TP hit ${mint} at ~${pnlPct.toFixed(2)}%\nExited 100% — ~${(Number(outLamports)/1e9).toFixed(6)} SOL.`
+            `🏁 TP hit ${mint} at ~${pnlPct.toFixed(2)}%\nExited 100%${res.route==='jupiter'?` — ~${(Number(res.outLamports||0n)/1e9).toFixed(6)} SOL`:''}.`
           );
           delete positions[mint]; savePositions(); continue;
         }
 
-        // (legacy behavior: partial TP then final)
+        // partial TP then final
         if (!p.tookPartialTP) {
           const toSell = tokenBalRaw / 2n;
           if (toSell > 0n) {
-            const { outLamports } = await sellTokensForSol({ mint, amountRaw: toSell, slippageBps: THIN.SLIPPAGE_BASE });
+            const res = await smartSell({ mint, amountRaw: toSell });
             positions[mint].slPct = 0; positions[mint].tookPartialTP = true; savePositions();
-            if (lastChatId) bot.telegram.sendMessage(lastChatId, `✅ Partial TP ${mint} at ~${pnlPct.toFixed(2)}%\nSold 50%, SL → breakeven.\nRealized ~${(Number(outLamports)/1e9).toFixed(6)} SOL.`);
+            if (lastChatId) bot.telegram.sendMessage(lastChatId, `✅ Partial TP ${mint} at ~${pnlPct.toFixed(2)}%\nSold 50%${res.route==='jupiter'?` — ~${(Number(res.outLamports||0n)/1e9).toFixed(6)} SOL`:''}. SL → breakeven.`);
           }
           continue;
         } else {
-          const { outLamports } = await sellTokensForSol({ mint, amountRaw: tokenBalRaw, slippageBps: THIN.SLIPPAGE_BASE });
-          if (lastChatId) bot.telegram.sendMessage(lastChatId, `🏁 Final TP ${mint} at ~${pnlPct.toFixed(2)}%\nExited ~${(Number(outLamports)/1e9).toFixed(6)} SOL.`);
+          const res = await smartSell({ mint, amountRaw: tokenBalRaw });
+          if (lastChatId) bot.telegram.sendMessage(lastChatId, `🏁 Final TP ${mint} at ~${pnlPct.toFixed(2)}%\nExited${res.route==='jupiter'?` ~${(Number(res.outLamports||0n)/1e9).toFixed(6)} SOL`:''}.`);
           delete positions[mint]; savePositions(); continue;
         }
       }
@@ -657,201 +766,49 @@ async function monitorPositions() {
 }
 setInterval(monitorPositions, Number(POLL_SECONDS) * 1000);
 
-// -------------------- DEXSCREENER FETCH via SEARCH (with mirror fallback) --------------------
-
-async function fetchDexscreenerJson(path, { tries = 3 } = {}) {
-  // Try your Worker first, then official API
-  const envBase = (process.env.DEXSCREENER_BASE || '').replace(/\/$/, '');
-  let bases = [
-    envBase,                          // e.g. https://old-resonance-6acd.heitertluke.workers.dev/ds
-    'https://api.dexscreener.com'     // fallback
-  ].filter(Boolean);
-
-  let lastErr;
-  for (const base of bases) {
-    const url = `${base}${path}`;
-    for (let i = 1; i <= tries; i++) {
-      try {
-        const opts = {
-          headers: { 'User-Agent': 'sol-autopilot/1.0', 'Accept': 'application/json' }
-        };
-        if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
-          opts.signal = AbortSignal.timeout(15000);
-        }
-
-        const r = await fetch(url, opts);
-        if (!r.ok) {
-          const text = await r.text().catch(() => '');
-          // On explicit 403/404, switch to next base
-          if (r.status === 403 || r.status === 404) {
-            console.warn(`[DEX] ${r.status} at ${url} — switching base…`);
-            break;
-          }
-          throw new Error(`HTTP ${r.status} ${r.statusText} — ${text.slice(0, 200)}`);
-        }
-        return await r.json();
-      } catch (e) {
-        lastErr = e;
-        console.error(`[DEX] request failed (try ${i}/${tries}) ${url}:`, e.message);
-        await new Promise(res => setTimeout(res, 1000 * i));
-      }
-    }
-  }
-  throw lastErr || new Error('All Dexscreener bases failed');
-}
-
-// -------------------- DEXSCREENER: wide fan-out search & merge --------------------
-const DEX_MAX_RESULTS = Number(process.env.DEX_MAX_RESULTS || '200');
-
-// Build query seeds (base + optional from env)
-function buildSearchSeeds() {
-  const fromEnv = (process.env.AUTOPILOT_SEARCH_SEEDS || '').split(',')
-    .map(s => s.trim()).filter(Boolean);
-  if (fromEnv.length) return fromEnv;
-
-  const base = [
-    'chain:solana',
-    'solana raydium',
-    'solana orca',
-    'pump solana',
-    'memecoin solana',
-    'bonk',
-    'wif',
-    'pepe',
-    'cat',
-    'dog',
-  ];
-
-  const letters = 'abcdefghijklmnopqrstuvwxyz'.split('');
-  const alpha = letters.slice(0, 10).map(l => `solana ${l}`);
-  return [...base, ...alpha];
-}
-
-async function dsSearch(q) {
-  const path = `/latest/dex/search?q=${encodeURIComponent(q)}`;
-  try {
-    const data = await fetchDexscreenerJson(path, { tries: 2 });
-    const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
-    return pairs.filter(p => p?.chainId === 'solana' || /solana/i.test(p?.chainId || ''));
-  } catch (e) {
-    console.warn(`[DEX] seed "${q}" failed: ${e.message}`);
-    return [];
-  }
-}
-
-async function fetchDexScreenerSolanaPairs() {
-  const seeds = buildSearchSeeds();
-  const BATCH = 5;
-  const merged = new Map();
-
-  for (let i = 0; i < seeds.length; i += BATCH) {
-    const chunk = seeds.slice(i, i + BATCH);
-    const results = await Promise.allSettled(chunk.map(q => dsSearch(q)));
-
-    for (const r of results) {
-      if (r.status !== 'fulfilled') continue;
-      for (const p of r.value) {
-        const baseMint = p?.baseToken?.address;
-        if (!baseMint) continue;
-        if (!merged.has(baseMint)) {
-          merged.set(baseMint, p);
-        } else {
-          const old = merged.get(baseMint);
-          const oldScore = Number(old?.volume?.m5 || 0) + Number(old?.liquidity?.usd || 0)/10;
-          const newScore = Number(p?.volume?.m5 || 0) + Number(p?.liquidity?.usd || 0)/10;
-          if (newScore > oldScore) merged.set(baseMint, p);
-        }
-      }
-    }
-
-    if (merged.size >= DEX_MAX_RESULTS) break;
-    await new Promise(r => setTimeout(r, 200));
-  }
-
-  const all = Array.from(merged.values());
-  console.log(`[DEX] aggregated pairs=${all.length} from seeds=${seeds.length} (cap=${DEX_MAX_RESULTS})`);
-  return all.slice(0, DEX_MAX_RESULTS);
-}
-
-// -------------------- AUTOPILOT: select + loop --------------------
-function selectCandidates(pairs) {
+// -------------------- AUTOPILOT: candidate selection from Pump signals --------------------
+function selectCandidatesFromPump() {
   const openCount = Object.keys(positions).length;
   const room = Math.max(0, AUTOPILOT.maxOpen - openCount);
   if (room === 0) return [];
 
   const now = Date.now();
-  const ban = new Set(AUTOPILOT.blacklist);
-
-  // debugging counters
-  const drop = {
-    notSolana: 0, noBase: 0, blacklisted: 0,
-    liq: 0, vol5m: 0, buys5m: 0, chg5m: 0,
-    buys1m: 0, chg1m: 0, // NEW
-    cooldown: 0, pass: 0
-  };
-
-  const filtered = pairs
-    .filter(p => {
-      try {
-        const isSolana = p.chainId === 'solana' || /solana/i.test(p.chainId || '');
-        if (!isSolana) { drop.notSolana++; return false; }
-        const baseMint = p?.baseToken?.address;
-        if (!baseMint) { drop.noBase++; return false; }
-        if (ban.has(baseMint)) { drop.blacklisted++; return false; }
-
-        const liqUsd    = Number(p?.liquidity?.usd || 0);
-        const vol5m     = Number(p?.volume?.m5 || 0);
-        const buys5m    = Number(p?.txns?.m5?.buys || 0);
-        const change5m  = Number(p?.priceChange?.m5 || 0);
-        const buys1m    = Number(p?.txns?.m1?.buys || 0);
-        const change1m  = Number(p?.priceChange?.m1 || 0);
-
-        if (liqUsd   < AUTOPILOT.minLiqUsd)      { drop.liq++; return false; }
-        if (vol5m    < AUTOPILOT.minVol5m)       { drop.vol5m++; return false; }
-        if (buys5m   < AUTOPILOT.minBuys5m)      { drop.buys5m++; return false; }
-        if (change5m < AUTOPILOT.minChange5m)    { drop.chg5m++; return false; }
-
-        // NEW: 1m momentum gates
-        if (buys1m   < AUTOPILOT.minBuys1m)      { drop.buys1m++; return false; }
-        if (change1m < AUTOPILOT.minChange1m)    { drop.chg1m++;  return false; }
-
-        const baseLast = AUTOPILOT.lastTried[baseMint] || 0;
-        if (now - baseLast < AUTOPILOT.cooldownMs) { drop.cooldown++; return false; }
-
-        drop.pass++;
-        return true;
-      } catch {
-        return false;
-      }
-    })
-    .map(p => {
-      const baseMint = p.baseToken.address;
-      const w = AUTOPILOT.momoWeight || 1.8;
-      const score =
-        (Number(p.txns?.m5?.buys || 0) * 2) +
-        (Number(p.volume?.m5 || 0) / 500) +
-        (Number(p.priceChange?.m5 || 0)) +
-        // NEW: short-term “burst” bonus
-        (Number(p.txns?.m1?.buys || 0) * 1.2 * w) +
-        (Number(p.priceChange?.m1 || 0) * 1.5 * w);
-      return { baseMint, score };
-    })
-    .sort((a, b) => b.score - a.score);
-
-  console.log('[AUTO] drop stats', {
-    notSolana: drop.notSolana, noBase: drop.noBase, blacklisted: drop.blacklisted,
-    liq: drop.liq, vol5m: drop.vol5m, buys5m: drop.buys5m, chg5m: drop.chg5m,
-    buys1m: drop.buys1m, chg1m: drop.chg1m, // NEW
-    perMintCooldown: drop.cooldown, pass: drop.pass
-  });
-
   const picks = [];
-  for (const { baseMint } of filtered) {
-    if (picks.length >= room) break;
-    if (positions[baseMint]) continue;
-    picks.push(baseMint);
+
+  for (const [mint, _bucket] of feed.byMint.entries()) {
+    if (AUTOPILOT.blacklist.includes(mint)) continue;
+    if (positions[mint]) continue;
+
+    const baseLast = AUTOPILOT.lastTried[mint] || 0;
+    if (now - baseLast < AUTOPILOT.cooldownMs) continue;
+
+    const m = feed.metrics(mint);
+    if (!m || !isFinite(m.priceNowSol) || m.priceNowSol <= 0) continue;
+
+    // Momentum gates (sub-minute first)
+    if (m.buys15s  < AUTOPILOT.minBuys15s)    continue;
+    if (m.chg15s   < AUTOPILOT.minChange15s)  continue;
+    if (m.buys30s  < AUTOPILOT.minBuys30s)    continue;
+    if (m.chg30s   < AUTOPILOT.minChange30s)  continue;
+
+    // Minute/5m
+    if (m.buys1m   < AUTOPILOT.minBuys1m)     continue;
+    if (m.chg1m    < AUTOPILOT.minChange1m)   continue;
+    if (m.buys5m   < AUTOPILOT.minBuys5m)     continue;
+    if (m.chg5m    < AUTOPILOT.minChange5m)   continue;
+
+    // Score with extra weight to sub-minute bursts + 1m momo
+    const w = AUTOPILOT.momoWeight || 1.8;
+    const score =
+      (m.buys15s * 2.5) + (m.chg15s * 3.0) +
+      (m.buys30s * 1.8) + (m.chg30s * 2.2) +
+      (m.buys1m  * 1.2 * w) + (m.chg1m * 1.5 * w) +
+      (m.buys5m  * 0.8) + (m.chg5m * 1.0);
+
+    picks.push({ mint, score });
   }
-  return picks;
+
+  return picks.sort((a,b)=>b.score - a.score).slice(0, room).map(p => p.mint);
 }
 
 async function autopilotLoop() {
@@ -859,22 +816,7 @@ async function autopilotLoop() {
   try {
     if (Date.now() - AUTOPILOT.lastBuyAt < AUTOPILOT.cooldownMs) return;
 
-    const pairs = await fetchDexScreenerSolanaPairs();
-    console.log(`[AUTO] fetched pairs: ${pairs.length}`);
-
-    const candidates = selectCandidates(pairs);
-    console.log(`[AUTO] candidates after filters: ${candidates.length}`, {
-      minLiqUsd: AUTOPILOT.minLiqUsd,
-      minVol5m: AUTOPILOT.minVol5m,
-      minBuys5m: AUTOPILOT.minBuys5m,
-      minChange5m: AUTOPILOT.minChange5m,
-      minChange1m: AUTOPILOT.minChange1m,
-      minBuys1m: AUTOPILOT.minBuys1m,
-      maxOpen: AUTOPILOT.maxOpen,
-      open: Object.keys(positions).length,
-      budgetSol: AUTOPILOT.budgetSol
-    });
-
+    const candidates = selectCandidatesFromPump();
     if (!candidates.length) return;
 
     for (const mint of candidates) {
@@ -882,30 +824,28 @@ async function autopilotLoop() {
         AUTOPILOT.lastTried[mint] = Date.now(); saveAutopilotCfg();
         await verifyMintExists(mint);
 
-        const { outAmountRaw, totalSpentLamports, shardsExecuted } = await buyBySol({
-          mint, amountSol: AUTOPILOT.budgetSol, slippageBps: THIN.SLIPPAGE_BASE
-        });
+        const res = await smartBuy({ mint, amountSol: AUTOPILOT.budgetSol });
 
         positions[mint] = {
           mint,
-          entrySolSpent: Number(totalSpentLamports) / 1e9,
-          entryTokenRecvRaw: outAmountRaw.toString(),
+          entrySolSpent: res.spentSol,
+          entryTokenRecvRaw: (res.outRaw || 0n).toString(),
           tpPct: SCALP_TP_PCT,
           slPct: SCALP_SL_PCT,
           createdAt: new Date().toISOString(),
           lastCheck: null,
-          profileUsed: 'SCALP-THIN-AUTO',
+          profileUsed: 'SCALP-THIN-AUTO(PUMP)',
           tookPartialTP: false
         };
         savePositions();
 
         AUTOPILOT.lastBuyAt = Date.now(); saveAutopilotCfg();
 
-        const msg = `🤖 Autopilot BUY\nMint: ${mint}\nSpent: ${(Number(totalSpentLamports)/1e9).toFixed(6)} SOL\nShards: ${shardsExecuted}\nTP: +${SCALP_TP_PCT}% | SL: -${SCALP_SL_PCT}%`;
+        const msg = `🤖 Autopilot BUY (Pump)\nMint: ${mint}\nSpent: ${res.spentSol.toFixed(6)} SOL\nRoute: ${res.route}\nTP: +${SCALP_TP_PCT}% | SL: -${SCALP_SL_PCT}%`;
         console.log(msg);
         if (lastChatId) bot.telegram.sendMessage(lastChatId, msg);
 
-        break; // respect cooldown after one buy
+        break; // one buy per cooldown
       } catch (e) {
         console.error('[Autopilot buy error]', mint, e.message);
       }
@@ -916,7 +856,7 @@ async function autopilotLoop() {
 }
 setInterval(autopilotLoop, 60 * 1000);
 
-// -------------------- SAFE LONG-POLLING START --------------------
+// -------------------- START --------------------
 async function assertTelegramToken() {
   try {
     const me = await bot.telegram.getMe();
