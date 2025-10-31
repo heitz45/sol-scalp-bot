@@ -1,2 +1,20 @@
-node_modules
+# node
+node_modules/
+npm-debug.log*
+yarn.lock
+package-lock.json
+
+# env & local state
 .env
+.env.*
+positions.json
+autopilot.json
+
+# logs
+logs/
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
